@@ -255,3 +255,13 @@ The second leaderboard has its own generator and target folder:
 `generated_beyondarena_website_artifacts/clean_website_artifacts/` (`subsets/` + `result_plots/`) →
 Space repo's **`data_beyondarena/`**. Same delete-then-copy discipline applies. Only touch it when the
 maintainer asks for BeyondArena; this skill's default is the main leaderboard `data/`.
+
+The generator crosses four filter axes (split, size, features, tasks) and publishes every cell that
+holds at least one dataset, under `subsets/split_*/size_*/features_*/tasks_*/` (354 of the 500 cells
+today). The cells run in parallel with ray (about a minute and a half on 96 cores);
+`--skip-generate` re-runs only the convert step. Delete `subsets/` and `result_plots/` before
+copying: the unzipped `*.png` files that `data_loading.unzip_png` leaves there are gitignored and
+would be served stale. Then compare the file list against the Space's tracked one
+(`diff <(cd $SRC && find . -type f | sed 's|^\./||' | sort) <(cd $DST && git ls-files | sort)` is empty when no cell
+changed). Each cell must carry a `leaderboard_table.html` (one per `website_leaderboard.csv`), which
+the app embeds as the full table, and only the all-`all` cell carries `per_dataset_explorer.html`.

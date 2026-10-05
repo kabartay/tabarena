@@ -34,6 +34,328 @@ run against `main`. To reproduce an entry, check out its recorded **git SHA**.
 
 ---
 
+## 2026-09-28 — beyondarena_linear_24092026 (core2k extension)
+
+- **Model(s):** Linear (`LinearModel`), default config plus 200 random configs (201 per split) on the 1,503 BeyondArena
+  `core2k` splits outside `core`, 302,103 items, plus a retry of the 8 `home_credit_default_stability_1m` core configs
+- **Git SHA:** `47755216` (main, for the `core2k` subset from #615) in the detached worktree
+  `../tabarena-run-linear-core2k-28092026`; AutoGluon worktree `../autogluon-run-linear-24092026` at master `ebae7ae9`
+  (includes the L1 fix, autogluon #5933), the same AutoGluon as the `core` run
+- **Validation protocol:** BeyondArena's official protocol, asserted by `BeyondArenaContext`
+- **Purpose:** Extend the Linear rerun for issue #598 from `core` to `core2k`, reusing the `core` run's benchmark name
+  so its 101,899 results are skipped by the cache check.
+- **Notes:** SLURM partition `cpun416mtspotinteractive` (n4-standard-16 spot, 16 vCPU, 64 GB), run venv
+  `~/.venvs/tabarena_linear_core2k_28092026` built from the `core` run's frozen requirements with both worktrees
+  editable. The commits between the `core` run (`a37a5ca7` + `7e0960bc`) and `47755216` do not touch Linear fits: #612
+  does nothing with `use_pca=False` and #611 only renames the recorded rmse metric. Two arrays from one `setup`:
+  2,420 single-item tasks for the slowest tables (`ieee_fraud_detection`, `sdss_17`, `kdd_cup_09_appetency`,
+  `anes_voting_2026`, `home_credit_default_stability_1m`; 24 h SLURM limit) at 100 concurrent (1219104) and
+  14,985 bundles of 20 at 200 concurrent (1219105), raised to 290 once the first array drained. Failures: 21
+  tasks killed by SIGTERM (spot nodes lost, often within seconds of the start), two items hit Ray's "node timed out
+  during startup", and many tasks sat in `launch failed requeued held` until `scontrol release` (once leaving the
+  single-item array at 9 running tasks). slurmctld socket timeouts made `slurm_progress.sh` report DONE on an empty
+  `squeue`. The last 9 `kick` bundles (about 28 min per item) were cancelled and their items, with every other
+  missing one, relaunched as 384 single-item tasks (`setup-relaunch`, `ModelJob` name `cpu_relaunch`, 1237619) that
+  excluded `home_credit_default_stability_1m` while its 8 configs still ran. Eval post-processing ran the 122 GB
+  head node out of memory with 16 Ray workers; `num_cpus=6` fixed it. About 5,100 node-hours in total (estimate
+  before launch: 3,400 to 4,200). The 8 `home_credit_default_stability_1m` configs need 20 to 24 h each on
+  these nodes, so spot preemptions restarted several from scratch: 4 finished in the first array, r41 hit the 24 h
+  limit and was rerun alone with a 48 h limit (`setup-home-credit-48h`, 1239171, 18.9 h), r120 finished after a
+  restart, r138 finished at 20 h, and r5 hit the 24 h limit and finished on an on-demand copy on `cpuhigh32` (c4,
+  16 CPUs, 1239864; 8.6 h, so its fit time is from a faster machine type than every other item). Result: 404,010 of
+  404,010 items (`core` + `core2k`), including the 8 configs missing from the `core` upload. Reprocessed and
+  re-uploaded as the existing suite `beyondarena-2026-09-24` (`beyond_linear_2026_09_metadata`), processed on an
+  on-demand `cpuhigh32` node with 6 Ray workers; its HPO-trajectory step ran separately on `cpuhighmem96mt` with 40
+  workers (57 min), since 6 workers would have run past the 12 h job limit. 5 `Not close TEST` warnings
+  (`sat11_hand_algo_runtime` 4, `early_learning_predictors` 1; at most 0.102 percent of a split's test rows).
+  On `core2k` (40 methods): Linear [Rerun] tuned + ensemble #33 Elo 905, tuned #37 Elo 866, default #40 Elo 793.
+
+```python
+from tabarena.benchmark.experiment import BeyondArenaExperimentBundle
+from tabarena.benchmark.task.metadata import TaskSubset
+from tabarena.contexts import BeyondArenaContext
+from tabflow_slurm import BeyondArenaResourcesSetup, GCPSlurmSetup, ModelJob, PathSetup, TabArenaBenchmarkPlan
+
+path_setup = PathSetup(
+    workspace="/home/lennart_priorlabs_ai/workspace/benchmarking/tabarena_workspace",
+    python_path="/home/lennart_priorlabs_ai/.venvs/tabarena_linear_core2k_28092026/bin/python",
+)
+common = dict(
+    benchmark_name="beyondarena_linear_24092026",
+    task_subset=TaskSubset(subset=["core2k"]),
+    experiment_bundle=BeyondArenaExperimentBundle(model_verbosity=2),
+    path_setup=path_setup,
+    resources_setup=BeyondArenaResourcesSetup(),
+)
+SLOW_DATASETS = [
+    "ieee_fraud_detection-5e0af5cbbb73",
+    "sdss_17-3d9b16fdea21",
+    "kdd_cup_09_appetency-72d0143e7c3d",
+    "anes_voting_2026-58a0e941922e",
+    "home_credit_default_stability_1m-e56e2cf55fa2",
+]
+# setup: the main launch (two arrays: size-1 and size-20 bundles)
+TabArenaBenchmarkPlan(
+    model_jobs=[ModelJob(models=("LinearModel", 200), name="cpu")],
+    context=BeyondArenaContext(),
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=20,
+        bundle_size_per_dataset=dict.fromkeys(SLOW_DATASETS, 1), array_job_limit=300, time_limit_overhead=20,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+# setup-relaunch: every missing item except the still-running home_credit configs, one item per task
+context = BeyondArenaContext()
+datasets = sorted({t.dataset_name for t in context.task_metadata_collection._tasks} - {"home_credit_default_stability_1m"})
+TabArenaBenchmarkPlan(
+    model_jobs=[
+        ModelJob(
+            models=("LinearModel", 200), name="cpu_relaunch",
+            tasks=TaskSubset(subset=["core2k"], dataset_names=datasets),
+        )
+    ],
+    context=context,
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=1, array_job_limit=300, time_limit_overhead=20,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+# setup-home-credit-48h: the home_credit configs still missing, 48 h SLURM limit; only the index of r41 was submitted
+# (the others were still running), and later r5 and r138 as on-demand copies on --partition=cpuhigh32
+TabArenaBenchmarkPlan(
+    model_jobs=[
+        ModelJob(
+            models=("LinearModel", 200), name="cpu_home_credit_48h",
+            tasks=TaskSubset(subset=["core2k"], dataset_names=["home_credit_default_stability_1m"]),
+        )
+    ],
+    context=BeyondArenaContext(),
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=1, array_job_limit=300, time_limit_overhead=44,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+```
+
+---
+
+## 2026-09-24 — beyondarena_linear_24092026
+
+- **Model(s):** Linear (`LinearModel`), default config plus 200 random configs (201 per split) on the BeyondArena
+  `core` protocol, 101,907 items
+- **Git SHA:** `a37a5ca7` (main) plus the runner thread fix `7e0960bc` (PR #614, merged), in the detached worktree
+  `../tabarena-run-linear-24092026`; AutoGluon worktree `../autogluon-run-linear-24092026` at master `ebae7ae9`
+  (includes the L1 fix, autogluon #5933)
+- **Validation protocol:** BeyondArena's official protocol, asserted by `BeyondArenaContext`
+- **Purpose:** Rerun Linear for issue #598: AutoGluon's `LinearModel` fit every L1 classification config with L2.
+  Replaces the hosted `beyond_iid_benchmark_2026` Linear (26 configs on every split) with 201 configs on `core`.
+  Processed and uploaded as suite `beyondarena-2026-09-24` (`beyond_linear_2026_09_metadata`).
+- **Notes:** SLURM partition `cpun416mtspotinteractive` (n4-standard-16 spot, 16 vCPU, 64 GB), run venv
+  `~/.venvs/tabarena_linear_24092026` with both worktrees editable (another session switched the shared
+  `../autogluon` checkout mid-run on the first launch, so the run was moved to pinned worktrees). Bundle size 10 with
+  the large-dataset rule off (one array), 150 concurrent tasks next to the TabArena run, raised to 300 once that
+  finished. Relaunches: after the thread fix (all earlier results discarded), `setup-bigmem` for
+  `maps_router_eta_1m` (AutoGluon estimated 59.5 GB per fit against 48.7 GB usable, so its 201 items ran with
+  `fake_memory_for_estimates=96`; the folds then fit one at a time on 16 CPUs), and `setup-tail` (the last 385 items
+  as single-item tasks with a 24 h SLURM limit). 8 `home_credit_default_stability_1m` configs are missing: they ran
+  for up to 24 h against the 4 h config limit, which AutoGluon's LinearModel does not enforce, and were stopped as
+  time-limit failures. Slowest tables: `home_credit_default_stability_1m` (about 3.2 h per item, as in the hosted
+  suite), `ieee_fraud_detection` (median 3.1 h), `pva_revenue_prediction_kddcup98` L1 (about 3.4 h). Result:
+  101,899 of 101,907 items. Joint leaderboard against the hosted Linear on `core`: default Elo 789 vs 791, tuned 874
+  vs 847, tuned + ensemble 912 vs 883; the tuned gain mixes the L1 fix with the larger search (201 vs 26 configs).
+
+```python
+from tabarena.benchmark.experiment import BeyondArenaExperimentBundle
+from tabarena.benchmark.task.metadata import TaskSubset
+from tabarena.contexts import BeyondArenaContext
+from tabflow_slurm import BeyondArenaResourcesSetup, GCPSlurmSetup, ModelJob, PathSetup, TabArenaBenchmarkPlan
+
+path_setup = PathSetup(
+    workspace="/home/lennart_priorlabs_ai/workspace/benchmarking/tabarena_workspace",
+    python_path="/home/lennart_priorlabs_ai/.venvs/tabarena_linear_24092026/bin/python",
+)
+common = dict(
+    benchmark_name="beyondarena_linear_24092026",
+    task_subset=TaskSubset(subset=["core"]),
+    context=BeyondArenaContext(),
+    experiment_bundle=BeyondArenaExperimentBundle(model_verbosity=2),
+    path_setup=path_setup,
+    resources_setup=BeyondArenaResourcesSetup(),
+)
+# setup: the main launch
+TabArenaBenchmarkPlan(
+    model_jobs=[ModelJob(models=("LinearModel", 200), name="cpu")],
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=10, array_job_limit=150,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+# setup-bigmem: maps_router_eta_1m with a 96 GB memory budget reported to AutoGluon
+TabArenaBenchmarkPlan(
+    model_jobs=[
+        ModelJob(
+            models=("LinearModel", 200), name="cpu_bigmem", resources={"fake_memory_for_estimates": 96},
+            tasks=TaskSubset(subset=["core"], dataset_names=["maps_router_eta_1m"]),
+        )
+    ],
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=10, array_job_limit=150,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+# setup-tail: every missing item as its own task
+TabArenaBenchmarkPlan(
+    model_jobs=[ModelJob(models=("LinearModel", 200), name="cpu")],
+    scheduler_setup=GCPSlurmSetup(
+        cpu_partition="cpun416mtspotinteractive", bundle_size=1, array_job_limit=300, time_limit_overhead=20,
+        large_dataset_n_samples=None, large_dataset_n_features=None,
+    ),
+    **common,
+).setup_jobs()
+```
+
+---
+
+## 2026-09-24 — linear_24092026
+
+- **Model(s):** Linear (`LinearModel`), default config plus 200 random configs (201 per split) on all 816 TabArena
+  splits, 164,016 items
+- **Git SHA:** `a37a5ca7` (main) plus the runner thread fix `7e0960bc` (PR #614, merged), in the detached worktree
+  `../tabarena-run-linear-24092026`; AutoGluon worktree `../autogluon-run-linear-24092026` at master `ebae7ae9`
+  (includes the L1 fix, autogluon #5933)
+- **Validation protocol:** `8x1` (TabArena default, asserted by the context)
+- **Purpose:** Rerun Linear for issue #598: AutoGluon's `LinearModel` fit every L1 classification config with L2.
+  Replaces the hosted suite `tabarena-2025-10-20`. Processed and uploaded as suite `tabarena-2026-09-24`
+  (`lr_2026_09_method_metadata`).
+- **Notes:** SLURM partition `cpun416mtspotinteractive` (n4-standard-16 spot, 16 vCPU, 64 GB), run venv
+  `~/.venvs/tabarena_linear_24092026` with both worktrees editable, bundle size 10, 150 concurrent tasks next to the
+  BeyondArena run. Two false starts, both discarded: the first launch imported the shared `../autogluon`, which another
+  session switched to a work-in-progress branch mid-run; the second ran under the runner's exported
+  `OMP/MKL/OPENBLAS_NUM_THREADS=16`, which every Ray fold worker inherited (8 folds x 16 BLAS threads on 16 cores), so
+  L1 fits took up to 4,400 s instead of seconds. Fixed in #614 and relaunched (array 1189859, relaunch of 185
+  preempted items 1217901). No item failed; `launch failed requeued held` tasks needed `scontrol release`. Result:
+  164,016 of 164,016 items, processed with 11 `Not close TEST` warnings (diamonds, physiochemical_protein,
+  superconductivity; at most 0.014 percent of a split's test rows). Joint leaderboard against the hosted suite (all
+  subsets): default Elo 852 vs 852, tuned 947 vs 930, tuned + ensemble 990 vs 958; binary tuned + ensemble 1085 vs
+  1051, multiclass 1043 vs 980, regression 487 vs 488. Median train time per 1K rows: default 2.6 s vs 1.2 s, tuned
+  1175 s vs 238 s (L1 classification now runs `saga`, single-threaded and slow on wide tables).
+
+```python
+from tabarena.benchmark.experiment import TabArenaV0pt1ExperimentBundle
+from tabarena.benchmark.task.metadata import TaskSubset
+from tabflow_slurm import (
+    GCPSlurmSetup,
+    ModelJob,
+    PathSetup,
+    TabArenaV0pt1BenchmarkPlan,
+    TabArenaV0pt1ResourcesSetup,
+)
+
+plan = TabArenaV0pt1BenchmarkPlan(
+    benchmark_name="linear_24092026",
+    model_jobs=[ModelJob(models=("LinearModel", 200), name="cpu")],
+    task_subset=TaskSubset(),
+    path_setup=PathSetup(
+        workspace="/home/lennart_priorlabs_ai/workspace/benchmarking/tabarena_workspace",
+        python_path="/home/lennart_priorlabs_ai/.venvs/tabarena_linear_24092026/bin/python",
+    ),
+    experiment_bundle=TabArenaV0pt1ExperimentBundle(model_verbosity=2),
+    resources_setup=TabArenaV0pt1ResourcesSetup(num_cpus=None, memory_limit=None),
+    scheduler_setup=GCPSlurmSetup(cpu_partition="cpun416mtspotinteractive", bundle_size=10, array_job_limit=150),
+)
+plan.setup_jobs()
+```
+
+---
+
+## 2026-09-25 — beyondarena_tfms_22092026 (core2k extension)
+
+- **Model(s):** the nine models of the 2026-09-22 entry below (default config only, `NUM_CONFIGS=0`), same size scopes
+  (TabPFN-3.5, TabPFN-3.5-Fast and Causilo on every dataset; LimiX-2, TabFM, EXAONE-Tabular, RealTabPFN-v2.5,
+  TabDPT-1.3 and TabSwift on `!large`) and time limits (16 h on medium and large datasets, 4 h on tiny and small ones)
+- **Git SHA:** main `290bc251` (after #611, #612, #614 and #615) for launch 1; branch `fix/exaone-expandable-segments`
+  at `5d6e8e12` for the tail relaunch and at `f7eb3020` for the EXAONE-Tabular rerun; editable AutoGluon
+  `../autogluon` at `62f92309`
+- **Validation protocol:** BeyondArena's official protocol, asserted by `BeyondArenaContext`
+- **Purpose:** Extend the 2026-09-22 run from the `core` protocol (507 splits) to `core2k`, the 2,000-split cost-weighted
+  allocation of #615 (497 of the core splits plus 1,503 new ones over the same 142 datasets). Same `benchmark_name`,
+  so the cache check re-approved only the missing items; the core results of 2026-09-22 are reused.
+- **Notes:** 13,491 new items (`gpu_16h` 318, `gpu_16h_le100k` 600, `gpu` 12,573), 17,862 results in total (2,010 per
+  all-size model, 1,972 per `!large` model; the 10 core splits outside core2k are kept). The reused core results predate
+  #612 (text-embedding preprocessing) and #614 (thread variables, fit timing); the new ones ran after both. Run venv
+  `~/.venvs/tabarena_beyondarena_core2k_25092026`: the shared `tabarena_10082026` had drifted after the 2026-09-22 run
+  (tabpfn 9.0.0 to 8.4.0, tabdpt 1.3.1 to 1.2.0, editable AutoGluon re-pointed to another checkout), so the new venv
+  installs the frozen pins of that run's last launch (bucket env `fa539d8f9f83`, `--no-deps` because LimiX pins
+  torch 2.9.1) plus editable `../tabarena` and `../autogluon`. SkyPilot pools (`--scheduler skypilot-pool`, spot
+  `g4-standard-48`, RTX PRO 6000 96 GB, `fake_memory_for_estimates=96`, bundle size 1): launch 1 on
+  `tabarena-beyondarena-tfms-core2k-25092026` (64 workers, env `655f1fd83658`), the `gpu` group also on a second
+  64-worker pool `...-b` added at 10:50 UTC on the same claim queue (resizing the first pool would have replaced its
+  workers and restarted the running fits); pool 1 was taken down with 5 LimiX-2 fits running (about 57 idle workers)
+  and pool `-b` with 1, and those 6 were rerun on `...-tail` (7 workers, env `83dfe0a77076`) together with the EXAONE
+  fits below. Launch 1 ran 07:05 to 13:30 UTC; the tail ended 21:08 UTC (one santander LimiX-2 fit preempted and
+  restarted, 4.6 h). Failures: EXAONE-Tabular on `california_house_prices_2020` r1 and r2 ran out of CUDA memory (33 to
+  43 GiB reserved but unallocated). With expandable segments (`5d6e8e12`, Mitra-v2's `configure_cuda_allocator` moved to
+  `tabarena.models.warmup`) r1 passed (3,740 s) and r2 crawled on its first fold until `TimeLimitExceeded`: the temporal
+  split grows the training set per repeat (10,382 / 20,764 / 31,146 rows x 657 regression columns), and r2's 20.5M
+  in-context cells are the only split up to 100k rows above 10M (classification keeps at most 100 columns). `f7eb3020`
+  caps the support set at `max_support_cells=14M` (seeded `support_row_limit` subsample); r2 passed with it (5,600 s,
+  pool `...-exaone`, env `3589be1526ea`), and no other result is affected. Uploaded 2026-09-25 to the existing suite
+  `beyondarena-2026-09-22` (all nine methods re-processed and re-uploaded; registration unchanged). Eval on core2k
+  (37 methods, Elo anchored at XGBoost default): TabPFN-3.5 1385, Causilo 1339, TabPFN-3.5-Fast 1330, LimiX-2 1285,
+  TabFM 1278, EXAONE-Tabular 1255, RealTabPFN-v2.5 1150, TabDPT-1.3 1129, TabSwift 1052; on `!large` (120 datasets,
+  1,962 tasks, no imputation) TabPFN-3.5 1452, Causilo 1422, LimiX-2 1418, TabFM 1408, TabPFN-3.5-Fast 1406,
+  EXAONE-Tabular 1375, RealTabPFN-v2.5 1236, TabDPT-1.3 1209, TabSwift 1115. The core leaderboard reproduces the
+  2026-09-24 eval exactly.
+
+```python
+plan = TabArenaBenchmarkPlan(
+    benchmark_name="beyondarena_tfms_22092026",
+    model_jobs=[
+        ModelJob(
+            models=[(m, 0) for m in ("TabPFN-3.5", "TabPFN-3.5-Fast", "Causilo")],
+            name="gpu_16h",
+            resources={"num_gpus": 1, "fake_memory_for_estimates": 96, "time_limit": 16 * 3600},
+            tasks=TaskSubset(subset=["core2k", "medium|large"]),
+        ),
+        ModelJob(
+            models=[(m, 0) for m in ("LimiX-2", "TabFM", "EXAONE-Tabular", "RealTabPFN-v2.5", "TabDPT-1.3", "TabSwift")],
+            name="gpu_16h_le100k",
+            resources={"num_gpus": 1, "fake_memory_for_estimates": 96, "time_limit": 16 * 3600},
+            tasks=TaskSubset(subset=["core2k", "medium"]),
+        ),
+        ModelJob(
+            models=[(m, 0) for m in ("TabPFN-3.5", "TabPFN-3.5-Fast", "Causilo", "LimiX-2", "TabFM",
+                                     "EXAONE-Tabular", "RealTabPFN-v2.5", "TabDPT-1.3", "TabSwift")],
+            name="gpu",
+            resources={"num_gpus": 1, "fake_memory_for_estimates": 96, "time_limit": 4 * 3600},
+            tasks=TaskSubset(subset=["core2k", "!medium", "!large"]),
+        ),
+    ],
+    task_subset=TaskSubset(subset=["core2k"]),
+    context=BeyondArenaContext(),
+    experiment_bundle=BeyondArenaExperimentBundle(model_verbosity=2),
+    path_setup=PathSetup(
+        workspace="/home/lennart_priorlabs_ai/workspace/benchmarking/tabarena_workspace",
+        python_path="/home/lennart_priorlabs_ai/.venvs/tabarena_beyondarena_core2k_25092026/bin/python",
+    ),
+    resources_setup=BeyondArenaResourcesSetup(),
+    scheduler_setup=SkyPilotSetup(
+        bundle_size=1,
+        workers=64,
+        secrets=("HF_TOKEN",),
+        use_pool=True,
+        pool_name="tabarena-beyondarena-tfms-core2k-25092026",
+        api_server_endpoint="http://skypilot-api:46580",
+    ),
+)
+plan.setup_jobs()
+```
+
 ## 2026-09-22 — beyondarena_tfms_22092026
 
 - **Model(s):** TabPFN-3.5, TabPFN-3.5-Fast, Causilo, LimiX-2, TabFM, EXAONE-Tabular, RealTabPFN-v2.5, TabDPT-1.3,

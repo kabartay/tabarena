@@ -261,6 +261,7 @@ __BASE_CSS__
     <input class="pd-search" id="search" type="search"
            placeholder="Filter datasets by name, domain or source" aria-label="Filter datasets">
     <div class="pd-filtergroup" id="taskfilter"></div>
+    <div class="pd-filtergroup" id="splitfilter"></div>
     <div class="pd-filtergroup" id="sizefilter"></div>
     <div class="pd-filtergroup" id="balancefilter"></div>
     <span class="hint" id="count"></span>
@@ -313,6 +314,9 @@ __BASE_JS__
   const TRAJ = (CONFIG.trajectory && CONFIG.trajectory.rows) || [];
   const METRIC_DISPLAY = CONFIG.metricDisplay || {};
   const SIZE_BUCKETS = CONFIG.sizeBuckets || [];
+  const SPLIT_LABELS = { random: "IID", temporal: "Temporal", grouped: "Grouped" };
+  // The leaderboard's "classification" tab covers both, and the host preselects it by that key.
+  const CLASSIFICATION_TASKS = new Set(["binary", "multiclass"]);
 
   const titleEl = document.getElementById("title");
   if (CONFIG.title) titleEl.textContent = CONFIG.title; else titleEl.hidden = true;
@@ -471,6 +475,7 @@ __BASE_JS__
     contender: Math.min(CONFIG.defaultContender || 0, METHODS.length - 1),
     query: "",
     task: "all",
+    split: "all",
     size: "all",
     balance: "all",
     sort: "rank",
@@ -652,7 +657,9 @@ __BASE_JS__
     for (let d = 0; d < nD; d++) {
       const ds = DATASETS[d];
       if (!matchesQuery(ds)) continue;
-      if (state.task !== "all" && ds.task !== state.task) continue;
+      if (state.task === "classification" ? !CLASSIFICATION_TASKS.has(ds.task)
+          : (state.task !== "all" && ds.task !== state.task)) continue;
+      if (state.split !== "all" && ds.split !== state.split) continue;
       if (state.size !== "all" && SIZE_OF[d] !== state.size) continue;
       // "extreme" is the far end of "imbalanced", so it filters on its own flag.
       if (state.balance === "extreme" ? !ds.extreme : (state.balance !== "all" && ds.balance !== state.balance)) continue;
@@ -866,6 +873,7 @@ __BASE_JS__
     const ds = DATASETS[d];
     const items = [
       ["Task", TASK_SHORT[ds.task] || ds.task],
+      ds.split ? ["Split", SPLIT_LABELS[ds.split] || ds.split] : null,
       ["Metric", metricName(ds)],
       ["Train rows", fmtInt(trainRows(ds))],
       ["Dataset rows", fmtInt(ds.rows)],
@@ -1329,10 +1337,24 @@ __BASE_JS__
   const TASK_LABELS = { binary: "Binary", multiclass: "Multiclass", regression: "Regression" };
   const tasksPresent = [...new Set(DATASETS.map(ds => ds.task).filter(Boolean))]
     .sort((a, b) => (TASK_LABELS[a] || a).localeCompare(TASK_LABELS[b] || b));
+  // Offered once both kinds are present, where it narrows something the others do not.
+  const bothClassifications = [...CLASSIFICATION_TASKS].every(t => tasksPresent.includes(t));
   buildFilter("taskfilter", "Task", [
     { key: "all", label: "All" },
+    ...(bothClassifications ? [{ key: "classification", label: "Classification" }] : []),
     ...tasksPresent.map(t => ({ key: t, label: TASK_LABELS[t] || t })),
   ], "task");
+  // How train and test were split. Only a benchmark that mixes regimes (BeyondArena) gets the
+  // row: on an all-IID one it would be a single chip that filters nothing.
+  const splitsPresent = Object.keys(SPLIT_LABELS).filter(k => DATASETS.some(ds => ds.split === k));
+  if (splitsPresent.length > 1) {
+    buildFilter("splitfilter", "Split", [
+      { key: "all", label: "All" },
+      ...splitsPresent.map(k => ({ key: k, label: SPLIT_LABELS[k] })),
+    ], "split");
+  } else {
+    document.getElementById("splitfilter").hidden = true;
+  }
   const sizesPresent = SIZE_BUCKETS.filter(b => SIZE_OF.includes(b.key));
   buildFilter("sizefilter", "Size", [
     { key: "all", label: "All" },
@@ -1371,13 +1393,15 @@ __BASE_JS__
     // picked in here changes the height. So a repeat of the host's last message is ignored
     // outright, rather than compared with the state on screen: otherwise the reader's own
     // chip would be undone by the echo of a selection they had already widened.
-    const key = [data.task, data.size, data.balance].map(v => String(v || "all")).join("|");
+    const key = [data.task, data.split, data.size, data.balance].map(v => String(v || "all")).join("|");
     if (key === lastHostFilter) return;
     lastHostFilter = key;
     if (typeof data.task === "string") state.task = data.task;
+    if (typeof data.split === "string") state.split = data.split;
     if (typeof data.size === "string") state.size = data.size;
     if (typeof data.balance === "string") state.balance = data.balance;
     syncFilter(document.getElementById("taskfilter"), "task");
+    syncFilter(document.getElementById("splitfilter"), "split");
     syncFilter(document.getElementById("sizefilter"), "size");
     syncFilter(document.getElementById("balancefilter"), "balance");
     renderList();

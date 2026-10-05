@@ -65,6 +65,7 @@ import gc
 import importlib
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -116,6 +117,10 @@ def warmup_always() -> bool:
     return os.environ.get(WARMUP_ALWAYS_ENV, "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
+#: A memory address in a default ``repr`` (``<pkg.Cls object at 0x7f...>``), dropped from :func:`warm_key`.
+_ADDRESS = re.compile(r" at 0x[0-9a-fA-F]+")
+
+
 def warm_key(
     model_cls: type, *, problem_type: str | None, num_gpus: float | None, hyperparameters: dict | None
 ) -> tuple:
@@ -123,9 +128,12 @@ def warm_key(
 
     The configuration is the model's own hyperparameters (AutoGluon's ``ag_args*`` stripped), since
     they select the checkpoint a shared-weights class loads; two configs of one class warm separately.
+    Values are compared by ``repr`` without memory addresses: a value holding objects with the default
+    ``repr`` (the feature generators of ``ag.model_specific_feature_generator_kwargs``, built anew
+    for every experiment) keys the same configuration whichever instances it holds.
     """
     hps = strip_ag_args(hyperparameters) if hyperparameters else {}
-    config = tuple(sorted((str(k), repr(v)) for k, v in hps.items()))
+    config = tuple(sorted((str(k), _ADDRESS.sub("", repr(v))) for k, v in hps.items()))
     return (f"{model_cls.__module__}.{model_cls.__qualname__}", problem_type, bool(num_gpus), config)
 
 
@@ -220,6 +228,18 @@ WARMUP_STEPS_BY_AG_KEY: dict[str, tuple[str | Callable[[], None], ...]] = {
     "TABPFN-2.6": ("torch", "tabpfn", "tabpfn.model_loading"),
     "REALTABPFN-V2": ("torch", "tabpfn", "tabpfn.model_loading"),
     "REALTABPFN-V2.5": ("torch", "tabpfn", "tabpfn.model_loading"),
+}
+
+
+#: Cheapness knobs the dummy fit merges over the configuration of AutoGluon built-in model classes,
+#: keyed by their registry ``ag_key`` like :data:`WARMUP_STEPS_BY_AG_KEY` (a class that declares
+#: ``cheap_hyperparameters`` uses its own). The gradient-boosted trees see no validation data in the
+#: dummy fit, so nothing stops them early: without a cap they boost the configuration's whole round
+#: budget (10,000 by default, more when a configuration raises it) until the time limit.
+CHEAP_HYPERPARAMETERS_BY_AG_KEY: dict[str, dict[str, Any]] = {
+    "GBM": {"num_boost_round": 10},
+    "CAT": {"iterations": 10},
+    "XGB": {"n_estimators": 10},
 }
 
 
@@ -394,6 +414,44 @@ def warmup_imports_best_effort(*module_names: str, report: WarmupReport | None =
         if _run_step(report, f"import:{name}", functools.partial(importlib.import_module, name)):
             imported.append(name)
     return imported
+
+
+#: Allocator settings :func:`configure_cuda_allocator` applies when the environment sets none.
+CUDA_ALLOC_CONF = "expandable_segments:True"
+
+
+def configure_cuda_allocator() -> None:
+    """Enable expandable segments in torch's CUDA caching allocator for this process.
+
+    For wrappers whose large, shape-changing activations fragment the caching allocator. With
+    fixed-size segments it ends up holding a large share of the card in fragments it cannot hand
+    out as one block: Mitra-v2 prediction on hiva_agnostic (2563 rows, 1414 columns) failed on a
+    13.9 GiB request while 59.5 GiB were live and 32.8 GiB were reserved but unallocated on a 95 GiB
+    card, and EXAONE-Tabular's regressor on california_house_prices_2020 (10,382 rows, 657 columns)
+    failed on 17 to 20 GiB requests with 33 to 43 GiB reserved but unallocated. Expandable segments
+    let the allocator grow a segment in place, so that reserve stays usable. Allocation layout only;
+    the numerics are unchanged.
+
+    The allocator reads ``PYTORCH_CUDA_ALLOC_CONF`` when it first runs, so a wrapper calls this in
+    its ``warmup`` classmethod before the CUDA context exists, and again at the start of ``_fit`` as
+    a fallback: when CUDA is already initialized the setting is applied through torch's runtime
+    setter instead. An explicit ``PYTORCH_CUDA_ALLOC_CONF`` in the environment is respected and
+    left untouched. Idempotent.
+    """
+    if os.environ.get("PYTORCH_CUDA_ALLOC_CONF") is not None:
+        return
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = CUDA_ALLOC_CONF
+    import torch
+
+    if not torch.cuda.is_initialized():
+        return  # read from the environment when the allocator starts
+    set_settings = getattr(torch._C, "_accelerator_setAllocatorSettings", None)
+    if set_settings is None:  # torch < 2.9
+        set_settings = torch.cuda.memory._set_allocator_settings
+    try:
+        set_settings(CUDA_ALLOC_CONF)
+    except RuntimeError as exc:
+        logger.log(20, f"\tCould not apply {CUDA_ALLOC_CONF!r} to the running CUDA allocator: {exc}")
 
 
 def warmup_torch(*, cuda: bool | None = None, kernels: bool | None = None) -> list[str]:
@@ -573,6 +631,17 @@ def resolve_warmup_num_gpus(hyperparameters: dict | None, num_gpus: float | None
     return num_gpus
 
 
+def cheap_hyperparameters(model_cls: type) -> dict[str, Any]:
+    """The cheapness knobs the dummy fit merges over ``model_cls``'s configuration.
+
+    The class's own ``cheap_hyperparameters``, else :data:`CHEAP_HYPERPARAMETERS_BY_AG_KEY` for its ``ag_key``.
+    """
+    own = getattr(model_cls, "cheap_hyperparameters", None)
+    if own is not None:
+        return dict(own)
+    return dict(CHEAP_HYPERPARAMETERS_BY_AG_KEY.get(getattr(model_cls, "ag_key", None), {}))
+
+
 def strip_ag_args(hyperparameters: dict | None) -> dict:
     """A copy of ``hyperparameters`` without ``ag_args``, ``ag_args_fit`` and ``ag_args_ensemble``.
 
@@ -695,7 +764,8 @@ def warmup_dummy_fit(
     ``n_categorical=1``, ``seed=0``; a class may override ``n_rows``, ``n_features``,
     ``n_categorical`` and ``time_limit`` through ``warmup_dummy_fit_kwargs`` and merge cheapness knobs
     (``n_estimators=1``, ``fine_tune_steps=1``) over the config through
-    ``cheap_hyperparameters``; checkpoint-relevant keys must not be overridden there. The
+    ``cheap_hyperparameters`` (AutoGluon's gradient-boosted trees get a 10-round cap from
+    :data:`CHEAP_HYPERPARAMETERS_BY_AG_KEY`); checkpoint-relevant keys must not be overridden there. The
     model is built in a temporary directory, fitted with ``num_cpus`` (default 1), the resolved GPU
     count and the time limit, asked for ``predict_proba`` (classification) or ``predict``
     (regression) on the prediction frame, then deleted; the directory is removed, ``gc.collect()``
@@ -787,7 +857,7 @@ def warmup_dummy_fit(
                 seed=0,
             )
             hps = strip_ag_args(hyperparameters)
-            hps.update(getattr(model_cls, "cheap_hyperparameters", None) or {})
+            hps.update(cheap_hyperparameters(model_cls))
             model = model_cls(
                 path=tmp_dir,
                 name=f"warmup_{model_cls.__name__}",

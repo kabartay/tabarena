@@ -141,6 +141,10 @@ class _CheapMeanModel(_MeanModel):
     cheap_hyperparameters = {"n_estimators": 1}
 
 
+class _GbmKeyMeanModel(_MeanModel):
+    ag_key = "GBM"
+
+
 class _GpuOnlyMeanModel(_MeanModel):
     ag_key = "_WARMUP_MEAN_GPU"
     minimum_num_gpus = 1
@@ -606,6 +610,25 @@ def test_warm_memo_is_keyed_on_problem_type_device_and_config():
     )
 
 
+def test_warm_key_ignores_the_instances_a_config_holds():
+    """Feature generators rebuilt for every experiment key the same configuration; other values still count."""
+
+    class _Generator:
+        pass
+
+    def config(lr):
+        return {"lr": lr, "ag.model_specific_feature_generator_kwargs": {"feature_generators": [[_Generator()]]}}
+
+    first = wu.warm_key(_MeanModel, problem_type="binary", num_gpus=0, hyperparameters=config(1))
+    assert first == wu.warm_key(_MeanModel, problem_type="binary", num_gpus=0, hyperparameters=config(1))
+    assert first != wu.warm_key(_MeanModel, problem_type="binary", num_gpus=0, hyperparameters=config(2))
+    _MeanModel.fits.clear()
+    for _ in range(2):
+        hps = {"lr": 3, "init": _Generator()}
+        wu.warmup_model_cls(_MeanModel, problem_type="binary", num_cpus=1, num_gpus=0, hyperparameters=hps)
+    assert len(_MeanModel.fits) == 1
+
+
 def test_failed_dummy_fit_is_not_remembered_as_warm(caplog):
     with caplog.at_level(logging.WARNING):
         wu.warmup_model_cls(_BoomModel, problem_type="binary", num_cpus=1, num_gpus=0)
@@ -723,6 +746,41 @@ def test_dummy_fit_applies_class_overrides():
     assert report.dummy_fit["n_rows"] == 40
 
 
+def test_cheap_hyperparameters_cap_the_autogluon_gbdts():
+    from autogluon.tabular.models import CatBoostModel, LGBModel, XGBoostModel
+
+    assert wu.cheap_hyperparameters(LGBModel) == {"num_boost_round": 10}
+    assert wu.cheap_hyperparameters(CatBoostModel) == {"iterations": 10}
+    assert wu.cheap_hyperparameters(XGBoostModel) == {"n_estimators": 10}
+    assert wu.cheap_hyperparameters(_CheapMeanModel) == {"n_estimators": 1}
+    assert wu.cheap_hyperparameters(_MeanModel) == {}
+
+
+def test_tabm_dummy_fit_caps_its_epochs():
+    from tabarena.models.tabm.model import TabMModel
+
+    assert wu.cheap_hyperparameters(TabMModel) == {"n_epochs": 2}
+
+
+def test_realmlp_dummy_fit_trains_no_epochs():
+    from tabarena.models.realmlp.model import RealMLPModel
+
+    assert wu.cheap_hyperparameters(RealMLPModel) == {"n_epochs": 0}
+
+
+def test_dummy_fit_caps_the_rounds_of_an_autogluon_gbdt(recorded_imports):
+    _GbmKeyMeanModel.fits.clear()
+    wu.warmup_model_cls(
+        _GbmKeyMeanModel,
+        problem_type="binary",
+        num_cpus=1,
+        num_gpus=0,
+        hyperparameters={"num_boost_round": 50_000, "learning_rate": 0.02},
+    )
+    params = _GbmKeyMeanModel.fits[0]["params"]
+    assert params["num_boost_round"] == 10 and params["learning_rate"] == 0.02
+
+
 def test_dummy_fit_failure_is_recorded_not_raised(caplog):
     with caplog.at_level(logging.WARNING, logger="tabarena.models.warmup"):
         report = wu.warmup_model_cls(_BoomModel, problem_type="regression", num_cpus=1, num_gpus=0)
@@ -822,3 +880,23 @@ def test_run_warmup_fn_failure_prints_header_and_traceback(capsys):
     header = "Warm-up of method 'MyMethod' failed (fitting cold instead):"
     assert header in out.out
     assert "RuntimeError: warm-up bug" in out.err
+
+
+# --- CUDA allocator ---------------------------------------------------------------------------
+
+
+def test_configure_cuda_allocator_sets_expandable_segments(monkeypatch):
+    pytest.importorskip("torch")
+    monkeypatch.delenv("PYTORCH_CUDA_ALLOC_CONF", raising=False)
+    wu.configure_cuda_allocator()
+    import os
+
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == wu.CUDA_ALLOC_CONF
+
+
+def test_configure_cuda_allocator_respects_explicit_setting(monkeypatch):
+    monkeypatch.setenv("PYTORCH_CUDA_ALLOC_CONF", "max_split_size_mb:512")
+    wu.configure_cuda_allocator()
+    import os
+
+    assert os.environ["PYTORCH_CUDA_ALLOC_CONF"] == "max_split_size_mb:512"

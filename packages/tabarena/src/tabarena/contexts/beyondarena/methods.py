@@ -69,6 +69,15 @@ beyond_linear_metadata = lr_descriptor.method_metadata(
     config_default="LinearModel_c1_BAG_L1",
     **_common_bag_kwargs,
 )
+# Rerun of the 2026-09-24 run (`beyondarena_linear_24092026` in BENCHMARK_LOG.md): L1 honored for classification
+# (AutoGluon #5933, issue #598), per-worker BLAS threads (#614), the default config plus 200 random configs on the
+# core and core2k splits (the hosted suite above ran 26 configs on every split).
+beyond_linear_2026_09_metadata = lr_descriptor.method_metadata(
+    method="LinearModel",
+    ag_key="LR",
+    config_default="LinearModel_c1_BAG_L1",
+    **{**_common_bag_kwargs, "suite": "beyondarena-2026-09-24", "date": "2026-09-24", "verified": True},
+)
 beyond_random_forest_metadata = random_forest_descriptor.method_metadata(
     method="RandomForest",
     ag_key="RF",
@@ -201,7 +210,7 @@ beyond_tabswift_metadata = tabswift_descriptor.method_metadata(
 )
 
 beyond_method_metadata_lst: list[MethodMetadata] = [
-    beyond_linear_metadata,
+    beyond_linear_2026_09_metadata,
     beyond_random_forest_metadata,
     beyond_extra_trees_metadata,
     beyond_catboost_metadata,
@@ -226,4 +235,15 @@ beyond_method_metadata_lst: list[MethodMetadata] = [
 
 beyond_method_metadata_collection = MethodMetadataCollection(
     method_metadata_lst=beyond_method_metadata_lst,
+)
+
+# Metadata that a rerun has replaced in the roster above. Kept so that their hosted artifacts stay reachable
+# by (method, suite) through the complete collection. Append a method here whenever a rerun takes over its slot.
+beyond_methods_superseded: list[MethodMetadata] = [
+    beyond_linear_metadata,  # rerun beyondarena-2026-09-24 replaced it
+]
+
+# The roster plus every superseded variant: all hosted BeyondArena results.
+beyond_method_metadata_complete_collection = beyond_method_metadata_collection.with_additional_methods(
+    beyond_methods_superseded,
 )
