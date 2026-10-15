@@ -40,10 +40,18 @@ def prefetch_weights() -> str:
 class FinTFMModel(AbstractTorchModel):
     """fintfm: a synthetic-prior tabular foundation model for corporate credit risk.
 
-    An in-context classifier pretrained only on synthetic tasks -- a structural generative
-    model of company balance sheets and P&L, plus a generic random-graph structural causal
-    model -- and never on real tabular data. Prediction is a single forward pass with the
-    user's table supplied as context; there are no gradient updates at fit time.
+    An in-context classifier pretrained only on synthetic tasks and never on real tabular
+    data. The published binary checkpoint (``v4-cellattn-labels.pt``) was trained on the
+    financial prior alone, a structural generative model of company balance sheets and P&L
+    (``--p-financial 1.0``, fintfm ``docs/results/FINDINGS.md`` §91/§104); the generic
+    random-graph structural causal model is not in its training mixture. Prediction is a
+    single forward pass with the user's table supplied as context; there are no gradient
+    updates at fit time.
+
+    Missing values reach the model as NaN. fintfm embeds every cell with a separate
+    missingness mask, so imputing here would erase that signal and make a missing cell
+    indistinguishable from a real zero. A missing categorical becomes AutoGluon's ``-1``
+    category code, which the target encoder treats as a level of its own.
 
     Two architectural points differ from the published TFM generation. Cells carry a random
     per-task column identity, and cell-level attention runs across rows *within* a feature
@@ -133,6 +141,10 @@ class FinTFMModel(AbstractTorchModel):
         out of fold so no row informs its own statistic; query rows use the full training
         statistics, since their labels cannot leak. See
         ``fintfm.inference.categorical`` for why the out-of-fold step is not optional.
+
+        Numeric NaN is passed through unchanged for the model's missingness mask. A missing
+        categorical arrives as category code ``-1`` from the label encoder, a level distinct
+        from every observed category, and is target-encoded like any other level.
         """
         import numpy as np
         from fintfm.inference.categorical import CategoricalTargetEncoder
@@ -144,7 +156,7 @@ class FinTFMModel(AbstractTorchModel):
         if self._feature_generator is not None and self._feature_generator.features_in:
             X = X.copy()
             X[self._feature_generator.features_in] = self._feature_generator.transform(X=X)
-        arr = X.fillna(0).to_numpy(dtype=np.float32)
+        arr = X.to_numpy(dtype=np.float32, na_value=np.nan)
 
         if self._feature_generator is None or not self._feature_generator.features_in:
             return arr
