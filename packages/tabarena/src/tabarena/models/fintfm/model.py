@@ -293,6 +293,26 @@ class FinTFMModel(AbstractTorchModel):
         params.setdefault("random_state", self.random_seed)
         self.model = FinancialTFMRegressor(network, n_bins=bins, device=device, **params).fit(X, y)
 
+    @staticmethod
+    def _default_max_context() -> int:
+        """Default ``max_context``: 1000, or ``FINTFM_MAX_CONTEXT`` when set.
+
+        The environment override exists so a TabArena-Lite context sweep (fintfm audit
+        AU5.14: 500 and 750 against 1000) runs the default config without a code change. It
+        does not change the config name, so each setting needs its own results directory (the
+        Lite runner's ``FINTFM_RUN_NAME``), or the results cache returns the earlier numbers.
+        A run submitted as the default config leaves it unset. A ``max_context`` passed as a
+        hyperparameter takes precedence over both.
+        """
+        raw = os.environ.get("FINTFM_MAX_CONTEXT")
+        if raw is None or raw.strip() == "":
+            return 1000
+        value = int(raw)
+        if value <= 0:
+            raise ValueError(f"FINTFM_MAX_CONTEXT must be a positive integer, got {raw!r}")
+        logger.warning("fintfm: max_context default overridden to %d by FINTFM_MAX_CONTEXT", value)
+        return value
+
     def _set_default_params(self):
         default_params = {
             # D12: a single column-identity draw is the configuration that decision's own
@@ -300,7 +320,7 @@ class FinTFMModel(AbstractTorchModel):
             "n_ensemble": 8,
             # docs/results/FINDINGS.md §83/§84 measured context as nearly flat on a 1M-row panel;
             # 1000 is the largest value that is cheap on every machine this runs on.
-            "max_context": 1000,
+            "max_context": self._default_max_context(),
             # §81: identity-preserving, and materially cheaper wherever attention scores are
             # materialised (CPU and MPS). No effect on CUDA (§95).
             "feature_chunk": 16,
