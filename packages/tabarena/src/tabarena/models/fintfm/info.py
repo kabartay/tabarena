@@ -13,11 +13,9 @@ fintfm_method_metadata = MethodMetadata.config(
     ag_key="TA-FINTFM",
     model_key="FINTFM",
     config_default="FinTFM_c1_default_BAG_L1",
-    #: HPO is off because ``hpo.py`` declares no search space. Each inference-time knob was
-    #: measured and found flat or harmful: context size is nearly flat (fintfm
-    #: ``docs/results/FINDINGS.md`` S83/S84), retrieval harms at low prevalence (S70), and
-    #: ensembling over column-identity draws is a correctness setting rather than a
-    #: hyperparameter (``docs/design/DECISIONS.md`` D12).
+    #: ``can_hpo`` records whether the raw results hold more than one config, and the results
+    #: produced so far hold only the default. ``hpo.py`` now declares a search space; set this
+    #: to ``True`` once a run that includes sampled configs is the one being registered.
     can_hpo=False,
     #: Runs on CPU, MPS and CUDA; the reference machine has no CUDA at all.
     compute="cpu",

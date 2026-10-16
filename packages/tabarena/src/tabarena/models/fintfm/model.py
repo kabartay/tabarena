@@ -70,7 +70,12 @@ class FinTFMModel(AbstractTorchModel):
     **Capability limits are declared rather than worked around.** A checkpoint accepts at most
     ``max_features`` columns and ``max_classes`` classes; a task exceeding either raises
     instead of being silently truncated, so the benchmark records a skip rather than a
-    meaningless score.
+    meaningless score. The one opt-in exception is ``max_features_strategy="subsample"``
+    (classification only), under which fintfm scores a wider table with an ensemble whose
+    members each see a balanced round-robin subset of the columns, so every column is seen by
+    at least one member. It is off in the default config and on in every config sampled from
+    ``hpo.py``. On TabArena v0.1 it admits the three binary tasks wider than 136 features:
+    APSFailure (170), kddcup09_appetency (212) and Bioresponse (1776).
 
     Paper: none; the project's measurement log is its public record.
     Authors: Mukharbek Organokov
@@ -246,11 +251,12 @@ class FinTFMModel(AbstractTorchModel):
                 f"measure a task the model cannot represent."
             )
         n_features = X.shape[1]
-        if n_features > network.cfg.max_features:
+        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") != "subsample":
             raise AssertionError(
                 f"fintfm checkpoint accepts at most {network.cfg.max_features} features, "
                 f"task has {n_features}. Truncating would score a different task, so this "
-                f"raises instead."
+                f"raises instead. Pass max_features_strategy='subsample' to score it with "
+                f"an ensemble over column subsets."
             )
 
         # ``seed_name = "random_state"`` makes AutoGluon inject the seed into the params dict,
