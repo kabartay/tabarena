@@ -251,12 +251,13 @@ class FinTFMModel(AbstractTorchModel):
                 f"measure a task the model cannot represent."
             )
         n_features = X.shape[1]
-        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") != "subsample":
+        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") not in ("subsample", "select"):
             raise AssertionError(
                 f"fintfm checkpoint accepts at most {network.cfg.max_features} features, "
                 f"task has {n_features}. Truncating would score a different task, so this "
-                f"raises instead. Pass max_features_strategy='subsample' to score it with "
-                f"an ensemble over column subsets."
+                f"raises instead. Pass max_features_strategy='subsample' (an ensemble over "
+                f"column subsets) or 'select' (the top columns ranked on the training rows, "
+                f"fintfm DR8.3) to score it."
             )
 
         # ``seed_name = "random_state"`` makes AutoGluon inject the seed into the params dict,
