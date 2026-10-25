@@ -111,7 +111,14 @@ class FinTFMModel(AbstractTorchModel):
     #: quality the measurement says is not there. Declaring all three would raise coverage from
     #: 26/51 to 46/51; the coverage number is not worth the claim. See fintfm ``docs/results/FINDINGS.md``
     #: §121. Restore them here when the numbers justify it, not before.
-    _supported_problem_types: ClassVar[list[str]] = ["binary"]
+    #:
+    #: ``FINTFM_ALLOW_MULTICLASS=1`` adds multiclass for a local measurement run (fintfm
+    #: DR7.4), with the checkpoint from ``FINTFM_CHECKPOINT_MULTICLASS``. It is read once, at
+    #: import, so it must be set before the process starts; unset, the declaration is the
+    #: submitted one.
+    _supported_problem_types: ClassVar[list[str]] = (
+        ["binary", "multiclass"] if os.environ.get("FINTFM_ALLOW_MULTICLASS") == "1" else ["binary"]
+    )
 
     #: Not a CUDA-only model: it runs on CPU, MPS and CUDA, and the reference machine has no
     #: CUDA at all. Requiring a GPU here would make every fit fail on that machine rather than
@@ -251,7 +258,10 @@ class FinTFMModel(AbstractTorchModel):
                 f"measure a task the model cannot represent."
             )
         n_features = X.shape[1]
-        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") not in ("subsample", "select"):
+        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") not in (
+            "subsample",
+            "select",
+        ):
             raise AssertionError(
                 f"fintfm checkpoint accepts at most {network.cfg.max_features} features, "
                 f"task has {n_features}. Truncating would score a different task, so this "
