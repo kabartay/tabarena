@@ -37,6 +37,64 @@ def prefetch_weights() -> str:
     )
 
 
+#: Hyperparameters with this prefix configure fintfm's ``PartitionedTFMClassifier`` (the prefix
+#: dropped), the way fintfm's own ``large_n`` configuration section names them.
+_PARTITION_PREFIX = "partition_"
+
+
+def _wrap_large_n(estimator, large_n: str, partition_kwargs: dict):
+    """Wrap an unfitted classifier as the ``large_n`` hyperparameter asks.
+
+    ``"partition"`` routes rows with a shallow decision tree and gives every leaf its own
+    context (fintfm ``docs/results/FINDINGS.md`` §169); ``"none"`` returns the classifier
+    itself, so the default config is the plain classifier object. fintfm's boosting wrapper is
+    not offered: nothing has measured it on a score.
+
+    Args:
+        estimator: The unfitted ``FinancialTFMClassifier``.
+        large_n: ``"none"`` or ``"partition"``.
+        partition_kwargs: ``PartitionedTFMClassifier`` arguments, from the ``partition_*``
+            hyperparameters with the prefix dropped.
+
+    Returns:
+        ``estimator``, or an unfitted ``PartitionedTFMClassifier`` around it seeded with the
+        classifier's own ``random_state``.
+
+    Raises:
+        ValueError: For an unknown ``large_n``, or ``partition_*`` settings without
+            ``large_n="partition"``, which would otherwise be dropped without a word.
+    """
+    if large_n == "none":
+        if partition_kwargs:
+            raise ValueError(f"partition settings {sorted(partition_kwargs)} need large_n='partition'")
+        return estimator
+    if large_n != "partition":
+        raise ValueError(f"large_n must be 'none' or 'partition', got {large_n!r}")
+    from fintfm.inference.large_n import PartitionedTFMClassifier
+
+    return PartitionedTFMClassifier(estimator, random_state=int(estimator.random_state), **partition_kwargs)
+
+
+def _inner_estimators(model):
+    """Yield every estimator that holds a network: the model itself, or a partition's global
+    fallback, its template and its leaf classifiers.
+    """
+    leaves = getattr(model, "leaf_estimators_", None)
+    if leaves is None:
+        yield model
+        return
+    yield model.global_estimator_
+    for bag in leaves:
+        for est in bag.values():
+            if est is not None:
+                yield est
+    # The unfitted template shares the network and records its own device, so a later refit
+    # from it lands on the device the model was moved to.
+    template = getattr(model, "estimator", None)
+    if template is not None:
+        yield template
+
+
 class FinTFMModel(AbstractTorchModel):
     """fintfm: a synthetic-prior tabular foundation model for corporate credit risk.
 
@@ -73,9 +131,11 @@ class FinTFMModel(AbstractTorchModel):
     meaningless score. The one opt-in exception is ``max_features_strategy="subsample"``
     (classification only), under which fintfm scores a wider table with an ensemble whose
     members each see a balanced round-robin subset of the columns, so every column is seen by
-    at least one member. It is off in the default config and on in every config sampled from
-    ``hpo.py``. On TabArena v0.1 it admits the three binary tasks wider than 136 features:
-    APSFailure (170), kddcup09_appetency (212) and Bioresponse (1776).
+    at least one member. It is off in the default config. Every config sampled from ``hpo.py``
+    sets it, or ``"select"`` (the top columns ranked on the training rows) when the config
+    fine-tunes, which refuses column subsets. On TabArena v0.1 either admits the three binary
+    tasks wider than 136 features: APSFailure (170), kddcup09_appetency (212) and Bioresponse
+    (1776).
 
     Paper: none; the project's measurement log is its public record.
     Authors: Mukharbek Organokov
@@ -223,6 +283,13 @@ class FinTFMModel(AbstractTorchModel):
         # multiclass checkpoints never did.
         regression_path = params.pop("model_path_regression", None) or os.environ.get("FINTFM_CHECKPOINT_REGRESSION")
         n_bins = int(params.pop("n_bins", 10))
+        # Wrapper settings, not classifier arguments: popped before the rest reach
+        # FinancialTFMClassifier, which would reject them as unknown keywords.
+        large_n = params.pop("large_n", "none")
+        partition_kwargs = {
+            key.removeprefix(_PARTITION_PREFIX): params.pop(key)
+            for key in [k for k in params if k.startswith(_PARTITION_PREFIX)]
+        }
         checkpoint = params.pop("model_path", None) or os.environ.get("FINTFM_CHECKPOINT")
         if self.problem_type == "multiclass" and multiclass_path:
             checkpoint = multiclass_path
@@ -251,6 +318,8 @@ class FinTFMModel(AbstractTorchModel):
 
         X = self.preprocess(X, y=y, is_train=True)
         if self.problem_type == "regression":
+            if large_n != "none" or partition_kwargs:
+                raise AssertionError("fintfm large_n applies to classification only")
             self._fit_regression(X, np.asarray(y), network, device, n_bins, params)
             return
         n_classes = int(np.unique(np.asarray(y)).size)
@@ -281,13 +350,15 @@ class FinTFMModel(AbstractTorchModel):
         self._minority_flipped = self._flip_to_minority(y_fit)
         if self._minority_flipped:
             y_fit = 1 - y_fit
-        classifier = FinancialTFMClassifier(network, device=device, **params)
+        estimator = FinancialTFMClassifier(network, device=device, **params)
         partition = self._env_partition()
         if partition is not None:
-            from fintfm.inference.large_n import PartitionedTFMClassifier
-
-            classifier = PartitionedTFMClassifier(classifier, random_state=params["random_state"], **partition)
-        self.model = classifier.fit(X, y_fit)
+            # FINTFM_PARTITION (a whole-run arm) and the large_n hyperparameter (a search-space
+            # draw) both build the same wrapper; asking for both would leave one silently unused.
+            if large_n != "none" or partition_kwargs:
+                raise ValueError("FINTFM_PARTITION and the large_n/partition_* hyperparameters both ask for a partition; set one")
+            large_n, partition_kwargs = "partition", partition
+        self.model = _wrap_large_n(estimator, large_n, partition_kwargs).fit(X, y_fit)
 
     @staticmethod
     def _forced_device() -> str | None:
@@ -502,22 +573,6 @@ class FinTFMModel(AbstractTorchModel):
         logger.warning("fintfm: partitioned contexts on, FINTFM_PARTITION: %s", params)
         return params
 
-    def _inner_classifiers(self) -> list:
-        """Every fitted ``FinancialTFMClassifier`` behind ``self.model``.
-
-        One for the plain classifier; for a partitioned one, the template, the global
-        fallback and each leaf's. They share one network, but each records its own device.
-
-        Returns:
-            The classifiers, in no particular order.
-        """
-        if not hasattr(self.model, "leaf_estimators_"):
-            return [self.model]
-        inner = [self.model.estimator, self.model.global_estimator_]
-        for leaves in self.model.leaf_estimators_:
-            inner.extend(est for est in leaves.values() if est is not None)
-        return inner
-
     def _set_default_params(self):
         default_params = {
             # D12: a single column-identity draw is the configuration that decision's own
@@ -535,12 +590,26 @@ class FinTFMModel(AbstractTorchModel):
             self._set_default_param_value(param, val)
 
     def get_device(self) -> str:
-        return str(next(self._inner_classifiers()[0].model.parameters()).device)
+        """The device of the network predictions run through (the first inner estimator's)."""
+        est = next(_inner_estimators(self.model))
+        network = getattr(est, "model_", None)
+        if network is None:
+            network = est.model
+        return str(next(network.parameters()).device)
 
     def _set_device(self, device: str):
-        for clf in self._inner_classifiers():
-            clf.model.to(device)
-            clf.device = device
+        """Move every network predictions can run through to ``device``.
+
+        A fine-tuned classifier predicts through ``model_``, a copy of ``model``, so both are
+        moved; a partitioned model holds one classifier per leaf plus a global fallback, and
+        each is moved and told its device.
+        """
+        for est in _inner_estimators(self.model):
+            est.model.to(device)
+            tuned = getattr(est, "model_", None)
+            if tuned is not None:
+                tuned.to(device)
+            est.device = device
 
     def _more_tags(self) -> dict:
         return {"can_refit_full": True}

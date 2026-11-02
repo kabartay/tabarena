@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from tabarena.models.fintfm.model import FinTFMModel
+from tabarena.models.fintfm.model import FinTFMModel, _inner_estimators
 
 
 @pytest.mark.parametrize("raw", [None, "", "  "])
@@ -74,7 +74,7 @@ def test_set_device_reaches_every_inner_classifier() -> None:
     net = _Net()
     model.model = _Partitioned(net)
     model._set_device("cpu")
-    inner = model._inner_classifiers()
+    inner = list(_inner_estimators(model.model))
     assert len(inner) == 4
     assert all(clf.device == "cpu" for clf in inner)
     assert np.unique(net.moved_to).tolist() == ["cpu"]
