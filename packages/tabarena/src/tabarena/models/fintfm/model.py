@@ -137,6 +137,7 @@ class FinTFMModel(AbstractTorchModel):
         super().__init__(**kwargs)
         self._feature_generator: LabelEncoderFeatureGenerator | None = None
         self._categorical_encoder = None
+        self._minority_flipped = False
 
     def _preprocess(self, X: pd.DataFrame, y: pd.Series | None = None, is_train: bool = False, **kwargs) -> np.ndarray:
         """Encode categoricals as out-of-fold target statistics and emit a dense float array.
@@ -273,7 +274,50 @@ class FinTFMModel(AbstractTorchModel):
         # ``seed_name = "random_state"`` makes AutoGluon inject the seed into the params dict,
         # so it must not also be passed explicitly.
         params.setdefault("random_state", self.random_seed)
-        self.model = FinancialTFMClassifier(network, device=device, **params).fit(X, np.asarray(y))
+        y_fit = np.asarray(y)
+        self._minority_flipped = self._flip_to_minority(y_fit)
+        if self._minority_flipped:
+            y_fit = 1 - y_fit
+        self.model = FinancialTFMClassifier(network, device=device, **params).fit(X, y_fit)
+
+    def _flip_to_minority(self, y: np.ndarray) -> bool:
+        """Whether this fit codes the minority class as 1 (fintfm loss analysis, fix 2).
+
+        AutoGluon codes a binary target's second sorted label as 1, so on some tasks the class
+        the model treats as the positive outcome is the majority, while the financial prior
+        always made class 1 the rarer one (at most 30% of rows). ``FINTFM_MINORITY_POSITIVE=1``
+        swaps the codes when class 1 holds more than half of this fit's training rows, and
+        :meth:`_predict_proba` swaps the probability columns back, so AutoGluon reads the same
+        class it coded. Unset (the default), nothing changes. Read at fit time, so each bag
+        fold decides from its own rows; like ``FINTFM_PARAMS`` it does not change the config
+        name, so an arm needs its own results directory.
+
+        Args:
+            y: The fit's 0/1 target as AutoGluon coded it.
+
+        Returns:
+            ``True`` when the switch is on, the task is binary and class 1 is the majority.
+        """
+        import numpy as np
+
+        if os.environ.get("FINTFM_MINORITY_POSITIVE") != "1" or self.problem_type != "binary":
+            return False
+        flip = 2 * int(np.count_nonzero(y == 1)) > y.shape[0]
+        logger.warning("fintfm: FINTFM_MINORITY_POSITIVE set, class 1 recoded as 0: %s", flip)
+        return flip
+
+    def _predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
+        """Class probabilities, with the columns swapped back when the fit recoded the target.
+
+        Without a recoding this is AutoGluon's own path unchanged, regression included.
+        """
+        if not self._minority_flipped:
+            return super()._predict_proba(X, **kwargs)
+        X = self.preprocess(X, **kwargs)
+        proba = self.model.predict_proba(X)
+        if self._minority_flipped:
+            proba = proba[:, ::-1]
+        return self._convert_proba_to_unified_form(proba)
 
     def _fit_regression(self, X, y, network, device: str, n_bins: int, params: dict):
         """Store the table as context for the binned-regression wrapper.
