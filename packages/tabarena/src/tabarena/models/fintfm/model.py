@@ -324,6 +324,60 @@ class FinTFMModel(AbstractTorchModel):
         logger.warning("fintfm: max_context default overridden to %d by FINTFM_MAX_CONTEXT", value)
         return value
 
+    @staticmethod
+    def _env_params() -> dict:
+        """Classifier defaults overridden by ``FINTFM_PARAMS``, a JSON object; empty when unset.
+
+        Lets a TabArena-Lite arm run the default config with different inference settings
+        and no code change: ``n_ensemble`` 1 (fintfm audit AU5.7), ``ensemble_class_shift``,
+        ``ensemble_transforms`` or ``ensemble_svd_components`` (AU5.12, design review DR3.5).
+        Same caveat as ``FINTFM_MAX_CONTEXT``: the config name does not change, so each arm
+        needs its own results directory (the Lite runner's ``FINTFM_RUN_NAME``). A run
+        submitted as the default config leaves it unset, and a hyperparameter passed
+        explicitly still takes precedence.
+
+        Every key must be a ``FinancialTFMClassifier`` argument. A misspelled key raises
+        rather than being ignored, because an ignored override completes the run and reports
+        the default's numbers under the arm's name. ``model``, ``device`` and
+        ``random_state`` are set by the adapter and refused here. A JSON list becomes a tuple,
+        the type ``ensemble_transforms`` takes.
+
+        Returns:
+            The overrides, keyed by classifier argument name.
+
+        Raises:
+            ValueError: the variable is not a JSON object, names an unknown or reserved
+                argument, or sets ``max_context`` while ``FINTFM_MAX_CONTEXT`` is also set.
+        """
+        import inspect
+        import json
+
+        raw = os.environ.get("FINTFM_PARAMS")
+        if raw is None or raw.strip() == "":
+            return {}
+        try:
+            params = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"FINTFM_PARAMS is not valid JSON: {exc}") from exc
+        if not isinstance(params, dict):
+            raise ValueError(f"FINTFM_PARAMS must be a JSON object, got {type(params).__name__}")
+
+        from fintfm.inference.classifier import FinancialTFMClassifier
+
+        reserved = {"self", "model", "device", "random_state"}
+        allowed = set(inspect.signature(FinancialTFMClassifier.__init__).parameters) - reserved
+        unknown = sorted(set(params) - allowed)
+        if unknown:
+            raise ValueError(
+                f"FINTFM_PARAMS names {unknown}, which are not FinancialTFMClassifier "
+                f"arguments the adapter lets you set; allowed: {sorted(allowed)}"
+            )
+        if "max_context" in params and os.environ.get("FINTFM_MAX_CONTEXT", "").strip():
+            raise ValueError("max_context is set by both FINTFM_PARAMS and FINTFM_MAX_CONTEXT; set one")
+        params = {k: tuple(v) if isinstance(v, list) else v for k, v in params.items()}
+        logger.warning("fintfm: classifier defaults overridden by FINTFM_PARAMS: %s", params)
+        return params
+
     def _set_default_params(self):
         default_params = {
             # D12: a single column-identity draw is the configuration that decision's own
@@ -336,6 +390,7 @@ class FinTFMModel(AbstractTorchModel):
             # materialised (CPU and MPS). No effect on CUDA (§95).
             "feature_chunk": 16,
         }
+        default_params.update(self._env_params())
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
 
