@@ -238,7 +238,10 @@ class FinTFMModel(AbstractTorchModel):
         # with Apple Silicon reports zero GPUs and would otherwise run this on CPU -- which is
         # 10-100x slower for this model and is the difference between completing a task inside
         # the harness's time budget and hitting TimeLimitExceeded.
-        if num_gpus and torch.cuda.is_available():
+        forced = self._forced_device()
+        if forced is not None:
+            device = forced
+        elif num_gpus and torch.cuda.is_available():
             device = "cuda"
         elif torch.backends.mps.is_available():
             device = "mps"
@@ -279,6 +282,30 @@ class FinTFMModel(AbstractTorchModel):
         if self._minority_flipped:
             y_fit = 1 - y_fit
         self.model = FinancialTFMClassifier(network, device=device, **params).fit(X, y_fit)
+
+    @staticmethod
+    def _forced_device() -> str | None:
+        """The device named by ``FINTFM_DEVICE``, or ``None`` to choose one automatically.
+
+        Unset, the adapter prefers CUDA, then MPS, then CPU. On Apple Silicon, Metal's memory
+        outside live tensors grows over many forward passes, and a fit with many of them (for
+        example ``context_strategy="retrieval"``, one context per query group) can exhaust it
+        within one dataset. ``FINTFM_DEVICE=cpu`` lets such a dataset rerun on CPU. Like
+        ``FINTFM_PARAMS``, it does not change the config name.
+
+        Returns:
+            ``"cpu"``, ``"mps"`` or ``"cuda"`` when set, else ``None``.
+
+        Raises:
+            ValueError: the variable names another device.
+        """
+        raw = os.environ.get("FINTFM_DEVICE", "").strip()
+        if not raw:
+            return None
+        if raw not in ("cpu", "mps", "cuda"):
+            raise ValueError(f"FINTFM_DEVICE must be cpu, mps or cuda, got {raw!r}")
+        logger.warning("fintfm: FINTFM_DEVICE set, running on %s", raw)
+        return raw
 
     def _flip_to_minority(self, y: np.ndarray) -> bool:
         """Whether this fit codes the minority class as 1 (fintfm loss analysis, fix 2).
