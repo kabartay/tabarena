@@ -281,7 +281,13 @@ class FinTFMModel(AbstractTorchModel):
         self._minority_flipped = self._flip_to_minority(y_fit)
         if self._minority_flipped:
             y_fit = 1 - y_fit
-        self.model = FinancialTFMClassifier(network, device=device, **params).fit(X, y_fit)
+        classifier = FinancialTFMClassifier(network, device=device, **params)
+        partition = self._env_partition()
+        if partition is not None:
+            from fintfm.inference.large_n import PartitionedTFMClassifier
+
+            classifier = PartitionedTFMClassifier(classifier, random_state=params["random_state"], **partition)
+        self.model = classifier.fit(X, y_fit)
 
     @staticmethod
     def _forced_device() -> str | None:
@@ -449,6 +455,69 @@ class FinTFMModel(AbstractTorchModel):
         logger.warning("fintfm: classifier defaults overridden by FINTFM_PARAMS: %s", params)
         return params
 
+    @staticmethod
+    def _env_partition() -> dict | None:
+        """Tree-partitioned contexts from ``FINTFM_PARTITION``, or ``None`` when unset.
+
+        Fix 4 of fintfm's TabArena loss analysis: wrap the classifier in
+        ``fintfm.inference.large_n.PartitionedTFMClassifier``, a shallow decision tree whose
+        leaves each carry their own context, with the global context as the fallback for a
+        leaf too small or missing a class (fintfm ``docs/results/FINDINGS.md`` §169, +0.0375
+        mean AP on V4FinBench at depth 2 with a 5% leaf floor). The value is a JSON object
+        of that class's arguments; ``{}`` takes its defaults, which are §169's. ``estimator``
+        and ``random_state`` are set by the adapter and refused here, and a misspelled key
+        raises for the reason ``_env_params`` gives. Like ``FINTFM_PARAMS``, it does not
+        change the config name, so an arm needs its own results directory.
+
+        Returns:
+            The partition arguments, or ``None`` for the unpartitioned default.
+
+        Raises:
+            ValueError: the variable is not a JSON object or names an unknown or reserved
+                argument.
+        """
+        import inspect
+        import json
+
+        raw = os.environ.get("FINTFM_PARTITION")
+        if raw is None or raw.strip() == "":
+            return None
+        try:
+            params = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"FINTFM_PARTITION is not valid JSON: {exc}") from exc
+        if not isinstance(params, dict):
+            raise ValueError(f"FINTFM_PARTITION must be a JSON object, got {type(params).__name__}")
+
+        from fintfm.inference.large_n import PartitionedTFMClassifier
+
+        reserved = {"self", "estimator", "random_state"}
+        allowed = set(inspect.signature(PartitionedTFMClassifier.__init__).parameters) - reserved
+        unknown = sorted(set(params) - allowed)
+        if unknown:
+            raise ValueError(
+                f"FINTFM_PARTITION names {unknown}, which are not PartitionedTFMClassifier "
+                f"arguments the adapter lets you set; allowed: {sorted(allowed)}"
+            )
+        logger.warning("fintfm: partitioned contexts on, FINTFM_PARTITION: %s", params)
+        return params
+
+    def _inner_classifiers(self) -> list:
+        """Every fitted ``FinancialTFMClassifier`` behind ``self.model``.
+
+        One for the plain classifier; for a partitioned one, the template, the global
+        fallback and each leaf's. They share one network, but each records its own device.
+
+        Returns:
+            The classifiers, in no particular order.
+        """
+        if not hasattr(self.model, "leaf_estimators_"):
+            return [self.model]
+        inner = [self.model.estimator, self.model.global_estimator_]
+        for leaves in self.model.leaf_estimators_:
+            inner.extend(est for est in leaves.values() if est is not None)
+        return inner
+
     def _set_default_params(self):
         default_params = {
             # D12: a single column-identity draw is the configuration that decision's own
@@ -466,11 +535,12 @@ class FinTFMModel(AbstractTorchModel):
             self._set_default_param_value(param, val)
 
     def get_device(self) -> str:
-        return str(next(self.model.model.parameters()).device)
+        return str(next(self._inner_classifiers()[0].model.parameters()).device)
 
     def _set_device(self, device: str):
-        self.model.model.to(device)
-        self.model.device = device
+        for clf in self._inner_classifiers():
+            clf.model.to(device)
+            clf.device = device
 
     def _more_tags(self) -> dict:
         return {"can_refit_full": True}
