@@ -9,6 +9,7 @@ from tabarena.evaluation.entrants import (
     SYSTEM_CATEGORIES,
     filter_results_to_pool,
     get_entrant_pool,
+    group_identical_pools,
     pool_key,
 )
 from tabarena.evaluation.eval_all import get_pool_reference_lines
@@ -43,8 +44,26 @@ def test_pool_admission(pool_key_, expected):
 
 
 def test_every_combination_of_categories_is_published():
-    assert len(ENTRANT_POOLS) == 2 ** len(SYSTEM_CATEGORIES)
+    # Each combination, with and without the methods that carry a leakage warning.
+    assert len(ENTRANT_POOLS) == 2 * 2 ** len(SYSTEM_CATEGORIES)
     assert len({p.key for p in ENTRANT_POOLS}) == len(ENTRANT_POOLS)
+
+
+def test_every_pool_has_a_twin_without_leakage():
+    keys = {p.key for p in ENTRANT_POOLS}
+    for pool in ENTRANT_POOLS:
+        if not pool.exclude_leakage:
+            twin = get_entrant_pool(pool.key + "_noleak")
+            assert twin.exclude_leakage and twin.categories == pool.categories and twin.key in keys
+    assert get_entrant_pool("models_noleak").label == "Models only, without leakage warnings"
+
+
+def test_a_method_with_a_leakage_warning_stays_out_of_the_twins_only():
+    # Whatever its class: a flagged model or system competes in a pool, never in its twin.
+    for method_class, tags in [_MODEL, _OPEN_SYSTEM]:
+        assert get_entrant_pool("open").admits(method_class, tags, leakage=True)
+        assert not get_entrant_pool("open_noleak").admits(method_class, tags, leakage=True)
+        assert get_entrant_pool("open_noleak").admits(method_class, tags)
 
 
 def test_pool_key_is_order_independent():
@@ -113,6 +132,29 @@ def test_results_for_unknown_methods_are_kept():
     df = pd.DataFrame({"ta_name": ["Mystery"], "ta_suite": ["s"]})
     kept = filter_results_to_pool(df, get_entrant_pool("models"), _info_frame())
     assert list(kept["ta_name"]) == ["Mystery"]
+
+
+def test_filter_results_drops_methods_with_a_leakage_warning_from_the_twin_only():
+    info = _info_frame()
+    info["leakage_evidence"] = [None, None, None, None]
+    info.loc[info["method"] == "TabM", "leakage_evidence"] = "https://github.com/autogluon/tabarena/issues/648"
+    assert list(filter_results_to_pool(_results_frame(), get_entrant_pool("models"), info)["ta_name"]) == ["TabM"]
+    assert filter_results_to_pool(_results_frame(), get_entrant_pool("models_noleak"), info).empty
+    kept = filter_results_to_pool(_results_frame(), get_entrant_pool("open_noleak"), info)
+    assert list(kept["ta_name"]) == ["AutoGluon"]
+
+
+def test_identical_pools_are_grouped():
+    """Without an LLM system, selecting the LLM category adds no one, so those pools are copies."""
+    info = _info_frame()
+    info = info[info["method"] != "Agent"]
+    groups = group_identical_pools(info)
+    assert sorted(key for group in groups for key in group) == sorted(pool.key for pool in ENTRANT_POOLS)
+    # No method carries a leakage warning either, so each pool's twin without them is a copy too.
+    assert ["models", "llm", "models_noleak", "llm_noleak"] in groups
+    assert ["open_api", "open_llm_api", "open_api_noleak", "open_llm_api_noleak"] in groups
+    # With the LLM system registered, only each pool and its twin without leakage warnings remain alike.
+    assert all(group == [group[0], f"{group[0]}_noleak"] for group in group_identical_pools(_info_frame()))
 
 
 def test_info_frame_without_the_new_columns_keeps_everything():

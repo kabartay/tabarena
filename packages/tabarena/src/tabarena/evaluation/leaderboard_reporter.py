@@ -23,12 +23,12 @@ from tabarena.evaluation.framework_naming import (
     get_method_rename_map,
 )
 from tabarena.plot.dataset_analysis import plot_train_time_deep_dive
-from tabarena.plot.interactive.pareto_explorer import build_pareto_explorer_html
+from tabarena.plot.interactive.pareto_explorer import build_pareto_explorer_html, leaderboard_time_columns
 from tabarena.plot.interactive.winrate_explorer import build_winrate_explorer_html
 from tabarena.plot.plot_ens_weights import create_heatmap
 from tabarena.plot.plot_pareto_focus import plot_pareto_focus
 from tabarena.utils.normalized_scorer import NormalizedScorer
-from tabarena.website.website_format import get_model_family, system_display_names
+from tabarena.website.website_format import get_model_family, system_display_names, system_shades
 
 MethodLabelStyle = str | Mapping[str, object]
 
@@ -105,6 +105,7 @@ class LeaderboardReporter:
         banned_pareto_methods: list[str] | None = None,
         elo_bootstrap_rounds: int = 200,
         elo_ymin: float = 800,
+        elo_ymax: float | None = None,
         keep_best: bool = False,
         figure_file_type: str = "pdf",
         use_latex: bool = False,
@@ -153,6 +154,7 @@ class LeaderboardReporter:
         self.folds = folds
         self.elo_bootstrap_rounds = elo_bootstrap_rounds
         self.elo_ymin = elo_ymin
+        self.elo_ymax = elo_ymax
         self.banned_model_types = banned_model_types
         self.keep_best = keep_best
 
@@ -825,6 +827,7 @@ class LeaderboardReporter:
         pareto_focus_methods: list[str] | None = None,
         pareto_explorer_kwargs: dict | None = None,
         website_only: bool = False,
+        static_figures: str = "all",
     ) -> pd.DataFrame:
         """Compute the leaderboard for ``df_results`` and render the TabArena figures.
 
@@ -842,6 +845,12 @@ class LeaderboardReporter:
         ``tuning-impact-elo`` bar plot, the win-rate matrix, and the Pareto
         figures + interactive explorer), skipping the rest of the paper
         figure suite (LaTeX tables, the horizontal Elo bar plot).
+
+        ``static_figures`` (default ``"all"``) set to ``"uncovered"`` skips the static figures an
+        interactive page shows and exports: the four ``pareto_front_*`` figures (the Pareto explorer),
+        the win-rate matrix figure (the win-rate explorer) and the vertical ``tuning-impact-elo`` bar
+        plot (the leaderboard explorer the website builds from ``website_leaderboard.csv``). The pages
+        this reporter writes are still written.
 
         ``plot_winrate_matrix`` (default ``True``) draws the win-rate matrix figure and its
         interactive page. The matrix itself is still computed and written to ``winrate_matrix.csv``
@@ -903,6 +912,8 @@ class LeaderboardReporter:
         # skipped. `plot` gates the figures alone (the CSVs still get written).
         save_artifacts = self.output_dir is not None
         plot = plot and save_artifacts
+        if static_figures not in ("all", "uncovered"):
+            raise ValueError(f"static_figures must be 'all' or 'uncovered', not {static_figures!r}")
         # Both only produce a CSV, so without an output_dir there is nothing for them to do.
         compute_fold_stability_curves = compute_fold_stability_curves and save_artifacts
         compute_fold_similarity = compute_fold_similarity and save_artifacts
@@ -996,8 +1007,12 @@ class LeaderboardReporter:
         method_info: pd.DataFrame = self.get_method_info(df=df_results_rank_compare)
         if save_artifacts:
             if self.method_metadata_info is not None:
+                # A left join, so methods without metadata (`new_results`) keep their rows.
                 method_info_full = pd.merge(
-                    left=method_info.reset_index(), right=self.method_metadata_info, on=["ta_name", "ta_suite"]
+                    left=method_info.reset_index(),
+                    right=self.method_metadata_info,
+                    on=["ta_name", "ta_suite"],
+                    how="left",
                 )
                 save_pd.save(path=self.output_dir / "method_info.csv", df=method_info_full)
             save_pd.save(path=self.output_dir / "results_per_split.csv", df=df_results_rank_compare)
@@ -1024,6 +1039,14 @@ class LeaderboardReporter:
             df_results_rank_compare["time_infer_s"]
             * 1000
             / df_results_rank_compare["dataset"].map(dataset_to_n_samples_test)
+        )
+        # Train plus inference per split, so a median total is the median of per-task totals rather than the sum of
+        # two medians taken on different tasks.
+        df_results_rank_compare["time_total_s"] = (
+            df_results_rank_compare["time_train_s"] + df_results_rank_compare["time_infer_s"]
+        )
+        df_results_rank_compare["time_total_s_per_1K"] = (
+            df_results_rank_compare["time_train_s_per_1K"] + df_results_rank_compare["time_infer_s_per_1K"]
         )
 
         if plot and plot_times:
@@ -1100,8 +1123,10 @@ class LeaderboardReporter:
             columns_to_agg_extra=[
                 "time_train_s",
                 "time_infer_s",
+                "time_total_s",
                 "time_train_s_per_1K",
                 "time_infer_s_per_1K",
+                "time_total_s_per_1K",
                 "normalized-error",
                 "normalized-error-task",
                 "imputed",
@@ -1174,7 +1199,7 @@ class LeaderboardReporter:
             )
 
         # vertical elo barplot
-        if plot:
+        if plot and static_figures == "all":
             self.plot_tuning_impact(
                 df=df_results_rank_compare,
                 df_elo=leaderboard,
@@ -1378,7 +1403,7 @@ class LeaderboardReporter:
                         winrate_title = f"{self.benchmark_name}-{subset_label} Win-rate Matrix"
                     else:
                         winrate_title = f"{self.benchmark_name} Win-rate Matrix"
-                if plot and plot_winrate_matrix:
+                if plot and plot_winrate_matrix and static_figures == "all":
                     try:
                         tabarena.plot_winrate_matrix(
                             winrate_matrix=winrate_matrix_best,
@@ -1407,8 +1432,11 @@ class LeaderboardReporter:
                     build_winrate_explorer_html(
                         winrate_matrix=winrate_matrix,
                         save_path=Path(self.output_dir) / "winrate_explorer.html",
+                        # The page's editable figure title opens on the subset, as the Pareto explorer's does.
+                        title=subset_label,
                         page_title=winrate_title or f"{self.benchmark_name} win-rate matrix",
                         system_names=system_display_names(self.method_metadata_info),
+                        system_shades=system_shades(self.method_metadata_info),
                     )
 
             # Off by default while the FIXME above (diagram possibly incorrect) stands.
@@ -1439,6 +1467,8 @@ class LeaderboardReporter:
                 pareto_focus_kwargs=pareto_focus_kwargs,
                 pareto_focus_methods=pareto_focus_methods,
                 pareto_explorer_kwargs=pareto_explorer_kwargs,
+                subset_label=subset_label,
+                static_figures=static_figures == "all",
             )
 
         return leaderboard
@@ -1489,24 +1519,20 @@ class LeaderboardReporter:
 
         Families follow the website classification (:func:`get_model_family`): declared for
         systems via ``method_class``, name-classified for models — the same coloring as the
-        interactive plots.
+        interactive plots, a shaded system's (:func:`system_shades`) included.
         """
         from matplotlib.lines import Line2D
 
-        from tabarena.plot.plot_pareto_focus import FAMILY_COLORS
-        from tabarena.website.website_format import get_model_family, system_display_names
+        from tabarena.plot.plot_pareto_focus import color_of, legend_swatches
 
         info = self.method_metadata_info
         systems = system_display_names(info) if info is not None and "method_class" in info.columns else frozenset()
         families = df["_label"].map(lambda name: get_model_family(name, system_names=systems))
-        colors = families.map(lambda family: FAMILY_COLORS.get(family, FAMILY_COLORS["Other"]))
-        present = set(families)
+        keys = df["_label"].map(system_shades(info)).fillna(families)
         handles = [
-            Line2D([], [], marker="o", ls="", color=color, label=family)
-            for family, color in FAMILY_COLORS.items()
-            if family in present
+            Line2D([], [], marker="o", ls="", color=color, label=label) for color, label in legend_swatches(set(keys))
         ]
-        return colors, handles
+        return keys.map(color_of), handles
 
     @staticmethod
     def _date_pareto_front(df: pd.DataFrame, *, metric: str, higher_is_better: bool) -> pd.DataFrame:
@@ -2029,14 +2055,18 @@ class LeaderboardReporter:
         pareto_focus_kwargs: dict | None = None,
         pareto_explorer_kwargs: dict | None = None,
         pareto_focus_methods: list[str] | None = None,
+        subset_label: str | None = None,
+        static_figures: bool = True,
     ):
-        """Render the four ``pareto_front_*`` figures and the two interactive explorer pages.
+        """Render the four ``pareto_front_*`` figures and the two interactive explorer pages; with
+        ``static_figures=False`` the explorer pages only, which show and export every view of the four.
 
         ``pareto_focus_methods`` are emphasized in the four static figures in addition to the
         Pareto-front members (see :func:`plot_pareto_focus`'s ``focus_methods``). They are resolved
         to the rendered display names by :meth:`_resolve_pareto_focus_methods` and unioned with any
         ``focus_methods`` already present in ``pareto_focus_kwargs``. The explorer pages do not
-        take a focus list; they keep their own front-based styling.
+        take a focus list; they keep their own front-based styling. They open titled with
+        ``subset_label`` unless ``pareto_explorer_kwargs`` gives a ``title``.
         """
         _f_map, f_map_type, f_map_inverse, f_map_type_name = self.get_framework_type_method_names(
             framework_types=framework_types,
@@ -2102,6 +2132,7 @@ class LeaderboardReporter:
             leaderboard_pareto["Family"] = [
                 get_model_family(m, system_names=systems) for m in leaderboard_pareto["Method"]
             ]
+        leaderboard_pareto["Shade"] = leaderboard_pareto["Method"].map(system_shades(self.method_metadata_info))
 
         leaderboard_pareto[self.method_col] = leaderboard_pareto["Method"] + leaderboard_pareto["suffix"]
         fig_rename_dict = {
@@ -2127,11 +2158,15 @@ class LeaderboardReporter:
         if not with_baselines:
             leaderboard_pareto = leaderboard_pareto[leaderboard_pareto["Type"] != "End-to-end"]
 
-        self.plot_pareto_elo_vs_time_infer(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
-        self.plot_pareto_elo_vs_time_train(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
-        self.plot_pareto_improvability_vs_time_infer(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
-        self.plot_pareto_improvability_vs_time_train(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
-        self.build_pareto_explorer(leaderboard=leaderboard_pareto, **(pareto_explorer_kwargs or {}))
+        if static_figures:
+            self.plot_pareto_elo_vs_time_infer(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
+            self.plot_pareto_elo_vs_time_train(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
+            self.plot_pareto_improvability_vs_time_infer(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
+            self.plot_pareto_improvability_vs_time_train(leaderboard=leaderboard_pareto, **plot_pareto_kwargs)
+        explorer_kwargs = pareto_explorer_kwargs or {}
+        if subset_label:
+            explorer_kwargs = {"title": subset_label, **explorer_kwargs}
+        self.build_pareto_explorer(leaderboard=leaderboard_pareto, **explorer_kwargs)
 
     @staticmethod
     def _resolve_pareto_focus_methods(leaderboard_pareto: pd.DataFrame, names: list[str]) -> set[str]:
@@ -2297,20 +2332,25 @@ class LeaderboardReporter:
         )
 
     def build_pareto_explorer(self, leaderboard: pd.DataFrame, **explorer_kwargs):
-        """Write the self-contained interactive Pareto explorers — one per time axis:
-        ``pareto_front_explorer.html`` (inference time) and
-        ``pareto_front_explorer_time_train.html`` (train time) — and their underlying
-        data (``pareto_front_points.csv``) next to the static figures.
+        """Write the self-contained interactive Pareto explorers and their underlying data
+        (``pareto_front_points.csv``) next to the static figures.
+
+        ``pareto_front_explorer.html`` offers every time axis the leaderboard carries on its x-axis
+        selector: inference, train and total (train + inference) time, per 1K samples or per task,
+        median or mean over datasets; it opens on total time per 1K samples (median).
+        ``pareto_front_explorer_time_train.html`` shows train time per 1K samples (median) only.
 
         ``explorer_kwargs`` go to :func:`build_pareto_explorer_html`, e.g. ``dim_off_front=True``.
         """
+        # explorer x column -> leaderboard column, in the selector's order (`X_AXIS_KEYS`)
+        x_columns = leaderboard_time_columns(leaderboard.columns)
         points = pd.DataFrame(
             {
                 "method": leaderboard["Method"],
                 "variant": leaderboard["Type"],
                 "family": leaderboard["Family"],
-                "x_infer": leaderboard["median_time_infer_s_per_1K"],
-                "x_train": leaderboard["median_time_train_s_per_1K"],
+                "shade": leaderboard["Shade"] if "Shade" in leaderboard.columns else None,
+                **{key: leaderboard[col] for key, col in x_columns.items()},
                 "imp": leaderboard["improvability"] * 100,
                 "elo": leaderboard["elo"],
             }
@@ -2323,16 +2363,16 @@ class LeaderboardReporter:
             imputed_frac = pd.Series(0.0, index=leaderboard.index)
         points["imputed"] = imputed_frac > 0
         points["imputed_pct"] = imputed_frac * 100
-        points = points.dropna(subset=["x_infer", "x_train", "imp", "elo"]).reset_index(drop=True)
+        points = points.dropna(subset=[*x_columns, "imp", "elo"]).reset_index(drop=True)
         if points.empty:
             return
 
         save_pd.save(path=str(Path(self.output_dir) / "pareto_front_points.csv"), df=points)
-        # One explorer per time axis (each page renders a single x-axis): inference is
-        # the panel the website led with historically, train time complements it.
+        # The axes in `X_AXIS_KEYS` order, so the page opens on total time per 1K samples (median). The train-time
+        # page keeps its single axis for the website's "I care about" switch, which swaps pages.
         build_pareto_explorer_html(
             points=points,
-            x_keys=["x_infer"],
+            x_keys=list(x_columns),
             # Mirrored against the trajectories explorer (chips right there).
             chips_side="left",
             save_path=Path(self.output_dir) / "pareto_front_explorer.html",
@@ -2625,7 +2665,7 @@ class LeaderboardReporter:
         if use_elo:
             metric = "elo"
             use_lim = True
-            lim = [self.elo_ymin, None]
+            lim = [self.elo_ymin, self.elo_ymax]
             lower_is_better = False
             df = df_elo.copy(deep=True)
             df = df[[self.method_col, "elo", "elo+", "elo-"]]

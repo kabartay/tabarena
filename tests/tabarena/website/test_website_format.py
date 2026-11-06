@@ -8,6 +8,8 @@ from tabarena.website.website_format import (
     add_metadata,
     get_model_family,
     system_display_names,
+    system_shade,
+    system_shades,
 )
 
 
@@ -18,6 +20,7 @@ from tabarena.website.website_format import (
         ("GBM", Constants.tree),
         ("TA-TABSWIFT", Constants.foundational),
         ("TA-ORION-MSP", Constants.foundational),
+        ("LIGHTPFN", Constants.foundational),
         ("MNCA", Constants.neural_network),
         # Display names (used by the Pareto/trajectory plotting paths).
         ("LightGBM", Constants.tree),
@@ -33,6 +36,8 @@ from tabarena.website.website_format import (
         ("TabPFN-3.5", Constants.foundational),
         ("TabPFN-3.5-Fast", Constants.foundational),
         ("TabDPT-1.3", Constants.foundational),
+        ("TabSTAR-v1.1", Constants.foundational),
+        ("FTFM", Constants.foundational),
         ("iLTM", Constants.foundational),
         ("Nori-30M", Constants.foundational),
         ("Linear", Constants.baseline),
@@ -74,6 +79,35 @@ def test_system_display_names_reads_the_metadata_frame():
 def test_system_display_names_without_the_column_is_empty(info):
     # An older collection has no method_class column; nothing is a system then.
     assert system_display_names(info) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("tags", "shade"),
+    [
+        (("with-llm", "closed-source-api"), "closed-source-api"),
+        (("with-llm",), "with-llm"),
+        ((), None),
+        # The two CSV forms: a website frame's Tags cell and a method_info.csv tuple repr.
+        ("with-llm;closed-source-api", "closed-source-api"),
+        ("('closed-source-api',)", "closed-source-api"),
+        (float("nan"), None),
+        (None, None),
+    ],
+)
+def test_system_shade_puts_the_api_before_the_llm(tags, shade):
+    assert system_shade(tags) == shade
+
+
+def test_system_shades_maps_only_the_shaded_systems():
+    info = pd.DataFrame(
+        [
+            {"display_name": "TabM", "method_class": "model", "tags": ()},
+            {"display_name": "TabFM+", "method_class": "system", "tags": ()},
+            {"display_name": "Chakra-Tab (full)", "method_class": "system", "tags": ("closed-source-api",)},
+        ]
+    )
+    assert system_shades(info) == {"Chakra-Tab (full)": "closed-source-api"}
+    assert system_shades(info.drop(columns="tags")) == {}
 
 
 def _metadata_frame(**overrides) -> pd.DataFrame:
@@ -140,3 +174,37 @@ def test_add_metadata_treats_missing_license_columns_as_commercial():
     )
     assert bool(with_nan["Commercial"]) is True
     assert with_nan["License"] == ""
+
+
+def test_add_metadata_emits_the_organization():
+    """A declared organization is passed on; an absent or NaN one (frames written before the
+    field existed, or a method that never declared it) becomes an empty cell.
+    """
+    declared = add_metadata(pd.Series({"method": "M"}), metadata_df=_metadata_frame(organization="Amazon"))
+    assert declared["Organization"] == "Amazon"
+    assert add_metadata(pd.Series({"method": "M"}), metadata_df=_metadata_frame())["Organization"] == ""
+    with_nan = add_metadata(pd.Series({"method": "M"}), metadata_df=_metadata_frame(organization=float("nan")))
+    assert with_nan["Organization"] == ""
+
+
+def test_add_metadata_emits_the_leakage_columns():
+    """The evidence and the proven datasets (semicolon-joined) of a method with a leakage warning;
+    empty cells for one without, including frames written before the fields existed and NaN cells.
+    """
+    url = "https://github.com/autogluon/tabarena/issues/648"
+    flagged = add_metadata(
+        pd.Series({"method": "M"}),
+        metadata_df=_metadata_frame(leakage_evidence=url, leakage_datasets=("blood", "diabetes")),
+    )
+    assert (flagged["Leakage"], flagged["LeakageDatasets"]) == (url, "blood;diabetes")
+    for metadata in (_metadata_frame(), _metadata_frame(leakage_evidence=float("nan"), leakage_datasets=float("nan"))):
+        out = add_metadata(pd.Series({"method": "M"}), metadata_df=metadata)
+        assert (out["Leakage"], out["LeakageDatasets"]) == ("", "")
+
+
+def test_add_metadata_emits_fits_at_predict():
+    declared = add_metadata(pd.Series({"method": "M"}), metadata_df=_metadata_frame(fits_at_predict=True))
+    assert bool(declared["FitsAtPredict"]) is True
+    # Frames written before the field existed, and NaN cells, read as a separate fit and predict.
+    for metadata in (_metadata_frame(), _metadata_frame(fits_at_predict=float("nan"))):
+        assert bool(add_metadata(pd.Series({"method": "M"}), metadata_df=metadata)["FitsAtPredict"]) is False

@@ -181,6 +181,46 @@ tasks of a many-class head (autogluon/tabarena#641). A cache that writes into th
 off weight sharing for that fit (`disabled_by`, see "Shared pretrained weights"), so the refit model
 then loads its own copy.
 
+Check the pickle, not only the tensors. A pickle writes each tensor's whole underlying storage, so a
+cache whose per-member entries are slices of one batched tensor (FTFM prefills its eight views in one
+batch on CUDA and slices the result per member) pickles every member with all members' data: eight
+times its size. AutoGluon pickles a model to save it and also in memory to size it
+(`_get_pickled_size`), so the inflation fills the disk and the RAM at once, and on a 22k-row table
+FTFM's refit model was past 34 GB before the worker ran out of disk. CPU fits often take an unbatched
+path and hide it, so force the batched one (FTFM: `view_batch_size=8`) or measure on a GPU:
+
+```python
+import pickle
+
+import torch
+
+
+def storage_bytes(obj) -> tuple[int, int]:
+    """(bytes the tensors view, bytes of the storages behind them) for the tensors inside ``obj``."""
+    seen, viewed = {}, 0
+    def walk(value):
+        nonlocal viewed
+        if torch.is_tensor(value):
+            seen[value.untyped_storage().data_ptr()] = value.untyped_storage().nbytes()
+            viewed += value.numel() * value.element_size()
+        elif isinstance(value, dict):
+            for item in value.values():
+                walk(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+    walk(obj)
+    return viewed, sum(seen.values())
+
+# After a fit with the network detached (shared weights pickle without it):
+# len(pickle.dumps(estimator)) should be close to the viewed bytes of its cache, not a multiple of them.
+```
+
+When the pickle is a multiple of the viewed bytes, copy each slice into its own storage after `fit`
+(`tensor.clone()` for a tensor whose `untyped_storage().nbytes()` exceeds `numel() * element_size()`),
+which is bit-exact, mark it as a developer fix and ask the library to do it upstream;
+`models/ftfm/_estimators.py` (`_own_storage`) is the reference, with its test in `models/ftfm/tests/`.
+
 ### Declare config as class attributes (AutoGluon 1.6)
 
 AutoGluon 1.6 replaced a set of override methods with class attributes. Declare the attribute;
@@ -231,8 +271,8 @@ a later call needs, store it on the instance and override the getter. The
 - **Torch model (GPU or CPU NN):** `AbstractTorchModel`. Implement `get_device()` + `_set_device()`.
 - **Non-torch model that still runs on GPU** (JAX/Flax like TabFM, or any library that places itself
   on the device via `CUDA_VISIBLE_DEVICES` / `jax.devices()`): use **`AbstractModel`**, add the GPU
-  *resource* methods (below), and do **not** implement `get_device`/`_set_device`. `tabstar/model.py`
-  is a GPU foundation model on `AbstractModel`; `tabfm/model.py` is the JAX example.
+  *resource* methods (below), and do **not** implement `get_device`/`_set_device`. `xrfm/model.py`
+  is a GPU model on `AbstractModel`; `tabfm/model.py` is the JAX example.
 - **Pure CPU / sklearn-like:** `AbstractModel`.
 
 ### GPU model on `AbstractModel` (non-torch) variant
@@ -415,7 +455,7 @@ are warm (parallel-fold Ray workers are fresh processes).
 
 ```python
 # Torch-backed model on AbstractModel: "torch" also creates the CUDA context.
-# References: modernnca, xrfm, tabstar.
+# References: modernnca, xrfm.
 warmup_modules: ClassVar[tuple[str, ...]] = ("torch", "somelib", "somelib.model")
 ```
 
@@ -454,7 +494,7 @@ once more for the refit child, inside the timed fit. Every foundation-model libr
 network inside one call its `fit` makes: a method on the estimator (tabpfn
 `_initialize_model_variables`, tabicl and tabldm `_load_model`), a module function (causilo
 `load_pretrained_model`, the vendored LimiX `load_model`) or a classmethod (`Tab2D.from_pretrained`,
-`TabStarModel.from_pretrained`). The wrapper declares that call and the inputs that decide which
+`TabSTARModel.from_pretrained`). The wrapper declares that call and the inputs that decide which
 network it builds; AutoGluon's `AbstractTorchModel` memoizes it per process (the mechanism lives in
 `autogluon.core.models.abstract.shared_weights`, whose module docstring is the reference):
 
@@ -508,7 +548,7 @@ The declaration, field by field:
 - `disabled_by`: input names (disable when truthy) or predicates over the inputs, for
   configurations under which the library writes into or casts the network (a compiled module, a
   cached training context, a forced dtype); that fit builds its own.
-- `copy_per_fit`: `True` for a fine-tuning model (Mitra-v2, TabSTAR): the registry keeps the pristine
+- `copy_per_fit`: `True` for a fine-tuning model (Mitra-v2, TabSTAR-v1.1): the registry keeps the pristine
   network and every fit, the one that built the entry included, trains a deep copy and pickles it.
 
 Everything else is `AbstractTorchModel`'s: the first call in the process runs the library's code and
@@ -546,7 +586,7 @@ sharing declare nothing. "Developer fixes" below is the general form of this pat
 References: `tabicl/model.py` (the example above), `tabpfn_3/model.py` (a predicate in
 `disabled_by`; TabPFN-2.5 keeps its own copy in `tabpfnv2_5/model.py`), `causilo/model.py` and
 `limix/model.py` (function loaders without a device input), `tabfm/model.py` (a module function with
-`dtype` in the key), `mitra_v2/model.py` and `tabstar/model.py` (`copy_per_fit`).
+`dtype` in the key), `mitra_v2/model.py` and `tabstar_v1p1/model.py` (`copy_per_fit`).
 
 Tests: `tests/tabarena/models/test_shared_weights_models.py` discovers every registered class that
 declares `shared_weights` and checks the declaration: well-formed, the loader resolves when the
@@ -769,6 +809,9 @@ from tabarena.models.{ModelKey}.model import {ClassName}Model
     cache_kwargs={"bucket": "tabarena", "prefix": "cache"},
     verified=False,                         # flip to True once benchmark run is signed off
     reference_url="{doc_url}",
+    # Who develops the model, as the leaderboard names it next to its logo; spell an existing
+    # organization exactly as other info.py files do. Leave unset for a solo author's package.
+    organization="{Organization}",
     # The license that governs *using* the model: the pretrained weights for a foundation model
     # (check the Hugging Face model card, not just the repo), else the library. SPDX id where one
     # exists. `commercial_use=False` for research-only / non-commercial weights; the leaderboard's
@@ -824,12 +867,13 @@ __all__ = ["gen_{ModelKey}", "{ModelKey}_info", "{ModelKey}_method_metadata"]
 
 ---
 
-## Test config (no per-model test file)
+## Test config (no per-model test file in `tests/`)
 
 Models are fit-tested by the single registry-driven `tests/tabarena/models/test_all_models.py`,
 which parametrizes over `get_model_registry()` and calls `FitHelper.verify_model(...)` per model.
 A new model is picked up automatically once its `info.py` is discoverable — **do not write a
-`test_{ModelKey}.py`**.
+`test_{ModelKey}.py` under `tests/`**. Tests specific to the wrapper go into the model's own
+`models/{ModelKey}/tests/` instead, outside the default suite and CI (SKILL.md, Step 3f).
 
 Only add a speed-up override to `tests/tabarena/models/smoke_configs.py` if the default
 (empty hyperparameters, all problem types) is too slow or unsupported. Key by the model's

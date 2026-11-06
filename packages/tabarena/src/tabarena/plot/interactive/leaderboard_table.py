@@ -23,7 +23,7 @@ from tabarena.plot.interactive.leaderboard_explorer import (
     _VARIANT_LABELS,
     _parse_model,
 )
-from tabarena.website.website_format import TAG_SPECS, Constants
+from tabarena.website.website_format import TAG_SPECS, Constants, system_shade
 
 #: Family display name -> the symbol the website shows in its ``Type`` column.
 #: Mirrors ``constants.model_type_emoji`` in the leaderboard app.
@@ -37,7 +37,8 @@ _FAMILY_SYMBOL = {
 }
 
 #: One entry per rendered column, in display order. ``key`` is the field on the
-#: point records; ``always`` columns cannot be switched off; ``heatmap`` columns
+#: point records; ``always`` columns cannot be switched off; ``on: False`` ones
+#: start switched off (the Columns menu brings them in); ``heatmap`` columns
 #: are shaded per column; ``logScale`` ones are shaded in log space because
 #: runtimes span orders of magnitude. ``hint`` is the header's hover text — kept
 #: to the direction and the unit, since the page embedding this one carries the
@@ -47,7 +48,7 @@ _COLUMNS: list[dict] = [
         "key": "position",
         "label": "#",
         "always": True,
-        "hint": "Position in this subset's published ranking.",
+        "hint": "Position in this subset's published ranking, 1 being the first.",
     },
     {
         "key": "family",
@@ -57,10 +58,10 @@ _COLUMNS: list[dict] = [
     },
     {
         "key": "model",
-        "label": "Model",
+        "label": "Method",
         "always": True,
         "hint": (
-            "The model, its tuning variant in brackets, ✔️ when the implementation was "
+            "The method, its tuning variant in brackets, ✔️ when the implementation was "
             "verified, and ‡ when some results are imputed."
         ),
     },
@@ -78,6 +79,7 @@ _COLUMNS: list[dict] = [
         "label": "Score",
         "decimals": 3,
         "heatmap": True,
+        "on": False,
         "hint": "Error rescaled per dataset to 1 (best) … 0 (median), then averaged. Higher is better.",
     },
     {
@@ -87,6 +89,7 @@ _COLUMNS: list[dict] = [
         "decimals": 2,
         "lowerBetter": True,
         "heatmap": True,
+        "on": False,
         "hint": "Mean rank across datasets. Lower is better.",
     },
     {
@@ -97,6 +100,7 @@ _COLUMNS: list[dict] = [
         "decimals": 2,
         "lowerBetter": True,
         "heatmap": True,
+        "on": False,
         "hint": "Harmonic mean of per-dataset ranks; rewards being excellent somewhere. Lower is better.",
     },
     {
@@ -139,6 +143,7 @@ _COLUMNS: list[dict] = [
         "decimals": 1,
         "lowerBetter": True,
         "heatmap": True,
+        "on": False,
         "hint": "Share of datasets whose score was imputed because the model could not run on them.",
     },
     {
@@ -146,6 +151,7 @@ _COLUMNS: list[dict] = [
         "column": "Hardware",
         "label": "Hardware",
         "text": True,
+        "on": False,
         "hint": "The hardware the reported runtimes were measured on.",
     },
 ]
@@ -171,12 +177,20 @@ def leaderboard_table_points(df_website_leaderboard: pd.DataFrame) -> pd.DataFra
     points["verified"] = (
         df["Verified"].astype(str).str.strip().eq("✔️").to_numpy() if "Verified" in df.columns else False
     )
+    # Whether the train time includes the prediction call (`MethodMetadata.fits_at_predict`).
+    points["fits_at_predict"] = (
+        df["FitsAtPredict"].fillna(False).astype(bool).to_numpy() if "FitsAtPredict" in df.columns else False
+    )
     # Semicolon-joined by `website_format.add_metadata`; empty for every model and for a
     # system that is open-source, local and LLM-free. Older tables have no column at all.
     # An empty Tags cell round-trips through CSV as NaN, and `str(nan)` is the string "nan",
     # so test for null rather than truthiness or an untagged system reads as tagged.
     tags = df["Tags"] if "Tags" in df.columns else pd.Series([""] * len(df))
     points["tags"] = [[] if pd.isna(v) else [t for t in str(v).split(";") if t] for v in tags]
+    points["shade"] = [
+        system_shade(t) if family == Constants.system else None
+        for t, family in zip(points["tags"], points["family"], strict=True)
+    ]
     for spec in _COLUMNS:
         column = spec.get("column")
         if not column:

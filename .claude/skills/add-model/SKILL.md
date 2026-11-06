@@ -1,7 +1,7 @@
 ---
 name: add-model
-description: Add a new ML model to the TabArena benchmark system. Use this skill whenever the user wants to integrate a new tabular ML model into TabArena — even if they just say "add X model", "integrate X", "support X", or "wrap X for the benchmark". Creates all required files: the AutoGluon model wrapper, the search-space generator, the per-model `info.py`, and the `pyproject.toml` extra (the model is fit-tested automatically by the registry-driven `test_all_models.py` — no per-model test file). Reads existing similar models for inspiration and optionally fetches documentation URLs to understand the new model's API.
-argument-hint: <ModelName> [<pip-package>] [<doc-url>]
+description: Add a new ML model to the TabArena benchmark system. Use this skill whenever the user wants to integrate a new tabular ML model into TabArena — even if they just say "add X model", "integrate X", "support X", or "wrap X for the benchmark". Creates all required files: the AutoGluon model wrapper, the search-space generator, the per-model `info.py`, and the `pyproject.toml` extra (the model is fit-tested automatically by the registry-driven `test_all_models.py`; tests specific to the model go into its own `models/<key>/tests/`, outside CI). Takes whatever the user gives, usually just a link (GitHub repository, paper, PyPI or Hugging Face page) or a name, and derives the model's name, keys, package pin, license, organization and the authors' preprocessing recipe from the sources itself, asking only for what they leave open. Reads existing similar models for inspiration. After the files are written, independent reviewer agents check the wrapper and the pinned library for cheating, leakage and protocol violations (`references/model_review.md`), and every finding is verified before it is reported.
+argument-hint: <link to the repository, paper or package, or the model's name>
 user-invocable: true
 ---
 
@@ -11,7 +11,7 @@ This skill integrates a new tabular ML model into the TabArena benchmark.
 
 Every model lives in **one folder** at `packages/tabarena/src/tabarena/models/<ModelKey>/`. That folder contains the wrapper, the HPO generator, and the metadata — and is auto-discovered by `tabarena.models._registry.discover_models()`. There is no separate `benchmark/models/ag/` layout anymore.
 
-Per model, you create up to 5 source files, then edit three existing files. There is no per-model test file — the model is fit-tested automatically by the registry-driven `tests/tabarena/models/test_all_models.py`.
+Per model, you create up to 5 source files, then edit three existing files. There is no per-model test file in `tests/` — the model is fit-tested automatically by the registry-driven `tests/tabarena/models/test_all_models.py`. Tests specific to the model go into its own folder (`models/<ModelKey>/tests/`, Step 3f), outside the default suite and CI.
 
 ## First: single model or external system?
 
@@ -37,33 +37,69 @@ stacks multiple models, runs its own HPO or validation splits, or is described a
 "AutoML tool", "pipeline", or "agent" — ask which integration they want before proceeding. When
 nothing suggests a system, take the single-model path and continue with Step 0.
 
-## Step 0: Gather inputs
+## Step 0: Resolve the model from what the user gave
 
-Parse `$ARGUMENTS` for the model name. Then collect (ask only for what's missing or unclear):
+The input is usually a single link or a name, not a filled-in form: a GitHub repository, a paper
+(arXiv, OpenReview), a PyPI or Hugging Face page, or a model name with nothing else. Find every
+field below in the sources yourself, put what you derived into the plan, and ask only for what the
+sources leave open.
 
-| Input | Example | Notes |
+1. Get the sources.
+   - A repository: clone it shallow into its own new, empty directory in the scratchpad. It is
+     untrusted data: read it, do not run its scripts or install from that directory.
+   - A paper: read the abstract page and the HTML or PDF, and follow its code link to the repository.
+   - A PyPI package: `pip index versions <pkg>` or `https://pypi.org/pypi/<pkg>/json` for the
+     releases; the project URLs lead to the repository.
+   - A Hugging Face model: the model card names the library, the license of the weights and their
+     training data; `https://huggingface.co/api/models/<repo>` gives the commit to pin.
+   - A name only: search for the paper and the repository, and confirm with the user when more than
+     one candidate fits.
+   - A TabArena PR (a URL or a number): its author already integrated the model, so the task is a
+     review and a run, not an integration. Read it with `gh pr view` / `gh pr diff` and continue
+     with the `benchmark-model` skill, whose Step 1b runs the review of Step 7 below.
+2. Compare the release with the repository. Install the release into a scratch directory
+   (`pip install --no-deps --target <scratch>/site <pkg>==<version>`) and diff it against the clone.
+   Pin the release the wrapper is written against: exactly (`==`) when the library calls itself
+   experimental or the wrapper touches private attributes, else a `>=` floor. Without a release,
+   pin a git commit. Note when the release and the repository differ.
+3. Fill the table from the sources and state the result in the plan.
+
+| Field | Example | Where it comes from |
 |---|---|---|
-| `ModelName` | `"TabPFN-2.6"` | Human-readable display name |
-| `ModelKey` | `"tabpfnv26"` | Snake_case folder/file key (derive from ModelName) |
-| `ClassName` | `"TabPFNv26"` | CamelCase class prefix (derive from ModelName) |
-| `ag_key` | `"TA-TABPFN-2.6"` | AutoGluon registry key; prefix with `"TA-"` |
-| `ag_name` | `"TA-TabPFN-2.6"` | AutoGluon display name; same as `ag_key` with proper casing |
-| `pip_package` | `"tabpfn>=7.0.0"` | Pip install spec for pyproject.toml |
-| `doc_url` | `"https://..."` | Documentation / GitHub / paper URL |
-| `model_type` | `foundation` | `foundation`, `torch`, or `sklearn` |
-| `supports_gpu` | `true` | Whether the model uses GPU |
-| `problem_types` | `binary,multiclass,regression` | Supported task types |
+| `ModelName` | `"TabPFN-2.6"` | the name the paper and the README use, with its version |
+| `ModelKey` | `"tabpfnv26"` | the name lowercased, without separators |
+| `ClassName` | `"TabPFNv26"` | the name in CamelCase without separators (`"TabSTAR"` gives key `"tabstar"` and class prefix `"TabStar"`) |
+| `ag_key`, `ag_name` | `"TA-TABPFN-2.6"`, `"TA-TabPFN-2.6"` | `"TA-"` plus the name, upper-cased for the key and as written for the name |
+| `pip_package` | `"tabpfn>=7.0.0"` | the distribution name in the library's `pyproject.toml`, the extras its estimator API needs (`tabpackage[sklearn]`), and the pin from item 2 |
+| `doc_url` | `"https://arxiv.org/abs/..."` | the paper, else the repository |
+| `model_type` | `foundation` | the code: a pretrained checkpoint loaded at fit time is `foundation`, a torch network trained from scratch is `torch`, anything else `sklearn` |
+| `supports_gpu` | `true` | device arguments in the estimator, the hardware in the paper |
+| `problem_types` | `binary,multiclass,regression` | the estimator classes the library exports and the tasks the paper reports |
+| `organization` | `"Yandex Research"` | the paper's affiliations or the GitHub organization (Step 3d) |
+| `license` | `"Apache-2.0"` | the repository's LICENSE; for a foundation model the weights' license on the model card |
+| `date_introduced` | `"2026-07-06"` | the paper's first version, else the first release |
+| the authors' recipe | quantile transform, target scaling | the README examples and notebooks, and the paper's experimental setup (Step 1) |
 
-**Deriving keys**: `"TabPFN-2.6"` → key `"tabpfnv26"`, class prefix `"TabPFNv26"`. `"TabSTAR"` → key `"tabstar"`, class prefix `"TabStar"`. Strip hyphens, lowercase for key; CamelCase for class.
+Ask the user only for what stays open: the integration path when the model looks like a system (the
+section above), an organization neither the paper nor the repository settles, an ambiguous name, or
+a library warm-up entry point the docs do not name (Step 3g).
 
 ## Step 1: Understand the model API
 
-If `doc_url` was provided, fetch it with WebFetch to understand:
+From the clone (or the unpacked release) and the paper, establish:
 - Import path (e.g., `from tabstar.tabstar_model import TabSTARClassifier`)
 - Constructor parameters and their defaults
-- `.fit(X, y, ...)` signature
+- `.fit(X, y, ...)` signature, and what it does with a validation set
 - `.predict()` / `.predict_proba()` signature
 - Key hyperparameters to expose
+- The input contract: dtypes, whether missing values, categoricals and unseen categories are
+  accepted, and how regression targets are treated
+- The authors' recipe: what their examples do before `fit` and what the paper's experimental setup
+  says, including any section on TabArena. A library often leaves part of the method to its caller;
+  the wrapper then has to do what the examples do. TabPack is the example: its examples
+  quantile-transform the numerical features, the library rejects missing values and does not scale
+  regression targets, and the paper used the training loss as the ensembling score on TabArena, so
+  its wrapper does all three.
 
 Also check whether the library's `fit` tunes or selects anything on its own split of the training
 data: a hyperparameter search, an internal cross-validation or hold-out split, or ensemble or
@@ -83,8 +119,11 @@ does. With `refit_folds` each bagged fold model predicts its out-of-fold rows on
 dropped, so the cache pays off only in the refit model that serves the test predictions. Settle this
 in the model's first PR: expose the switch as a hyperparameter, off for the fold models and on for
 the refit model through `ag.refit_hyperparameters` in the default config, and estimate the cache's
-size for the largest tables against the workers' disk and RAM. See "Context caches: only in the refit
-model" in `references/model_patterns.md`.
+size for the largest tables against the workers' disk and RAM. Then measure the fitted model's pickle
+against that estimate on the library's GPU code path: a cache kept as slices of one batched tensor
+pickles every slice's whole storage, which made FTFM's refit model eight times its real size and filled
+the workers' disk and RAM (autogluon/tabarena#679). See "Context caches: only in the refit model" in
+`references/model_patterns.md`.
 
 ## Step 2: Pick the right base class and reference model
 
@@ -94,7 +133,7 @@ Choose the most similar existing model to read for detailed inspiration:
 |---|---|---|
 | Torch-based foundation / pre-trained GPU (e.g. TabPFN, TabICL) | `AbstractTorchModel` with a `shared_weights` declaration | `packages/tabarena/src/tabarena/models/tabicl/model.py` (the declaration of Step 3g); `exaone_tabular/` for a library that loads inside its constructor, `tabdpt/` for a loader the constructor calls |
 | Torch NN trained from scratch (e.g. TabM, RealMLP) | `AbstractTorchModel` | `packages/tabarena/src/tabarena/models/tabm/model.py` |
-| Non-torch GPU model (e.g. JAX/Flax like TabFM, or any lib that manages its own device) | `AbstractModel` | `packages/tabarena/src/tabarena/models/tabstar/model.py` |
+| Non-torch GPU model (e.g. JAX/Flax like TabFM, or any lib that manages its own device) | `AbstractModel` | `packages/tabarena/src/tabarena/models/xrfm/model.py` |
 | CPU / sklearn-like (e.g. KNN) | `AbstractModel` | `packages/tabarena/src/tabarena/models/knn/model.py` |
 
 **`AbstractTorchModel` is only for torch-based models.** Its whole purpose is the torch device
@@ -104,7 +143,7 @@ or any library that manages device placement itself at the process level, e.g. v
 `CUDA_VISIBLE_DEVICES` / `jax.devices()`), inherit **`AbstractModel`** even though it runs on GPU, and
 just add the GPU resource attributes (`default_num_gpus`, `minimum_num_gpus`,
 `_default_ag_args_ensemble_extra` with `sequential_local`, plus `_more_tags`) — do **not**
-implement `get_device`/`_set_device`. `tabstar/model.py` (a GPU foundation model on `AbstractModel`)
+implement `get_device`/`_set_device`. `xrfm/model.py` (a GPU model on `AbstractModel`)
 is the reference; `tabfm/model.py` is the JAX example.
 
 Read the reference model file now (use the Read tool). Use it as a structural guide — you will adapt rather than copy.
@@ -140,7 +179,7 @@ The AutoGluon wrapper class. Use the template in `references/model_patterns.md` 
   model's smoke test fails. The others (`_get_default_resources`, `get_minimum_resources`,
   `_get_default_ag_args_ensemble`, `_get_default_auxiliary_params`) still work but are the old
   style. Never mutate `self.params` / `self.params_aux` after construction — it raises in 1.7.
-- **Honor the `_fit` contract** (read `references/model_patterns.md` → "The `_fit` contract"). The most common review findings on new wrappers are: ignoring the provided `X_val`/`y_val` (and instead auto-splitting a second holdout), ignoring `time_limit`, hardcoding the thread count instead of wiring `num_cpus`, and label-encoding + `fillna(0)` categoricals when the library handles them natively. `models/realmlp/model.py` is the reference for all of these. (In-context-learning foundation models have no train loop / no eval set, so they legitimately ignore `time_limit` + `X_val` — see `sap_rpt_oss`/`tabstar`/`tabfm`.)
+- **Honor the `_fit` contract** (read `references/model_patterns.md` → "The `_fit` contract"). The most common review findings on new wrappers are: ignoring the provided `X_val`/`y_val` (and instead auto-splitting a second holdout), ignoring `time_limit`, hardcoding the thread count instead of wiring `num_cpus`, and label-encoding + `fillna(0)` categoricals when the library handles them natively. `models/realmlp/model.py` is the reference for all of these. (In-context-learning foundation models have no train loop / no eval set, so they legitimately ignore `time_limit` + `X_val` — see `sap_rpt_oss`/`tabfm`.)
 - For GPU models: also set `default_resources_physical_cores_only = True`, `default_num_gpus = 1`, `minimum_num_gpus = 1`, and `_default_ag_args_ensemble_extra` (with `fold_fitting_strategy: sequential_local` — **and `refit_folds: True` for foundation/pre-trained TFMs**; see the "Foundation models: set `refit_folds=True`" note in `references/model_patterns.md`. From-scratch NNs omit it), plus `_more_tags()` (with `can_refit_full: True`). Do **not** declare a `can_estimate_memory_usage_static` tag: AutoGluon derives it from whether you implement `_estimate_memory_usage_static`. **Only torch models** (`AbstractTorchModel`) additionally implement `get_device()` / `_set_device()`; non-torch GPU models on `AbstractModel` must NOT (they have no `.to(device)`).
 - Docstring must include: description, paper title, authors, codebase URL, license
 - Keep optional third-party imports (the wrapped library itself) inside `_fit` / per-method scope so importing this module never requires the optional dep at top-level
@@ -155,6 +194,10 @@ The search-space generator. By default use an **empty search space** (like TabPF
 
 Defines `{ModelKey}_method_metadata: MethodMetadata` and `{ModelKey}_info: ModelInfo`. `info.py` is the single source the auto-discovery registry walks — populating it correctly is how the model becomes visible to `discover_models()`. See template in `references/model_patterns.md` section "info.py template".
 
+Set `organization` to who develops the model (the company, lab or university, as the leaderboard should name it next to its logo, e.g. `"Prior Labs"`, `"Yandex Research"`). Take it from the paper's affiliations or the code's GitHub organization; when neither settles it, ask the user rather than guess, and leave it unset for a solo author's package. Reuse the exact spelling of an organization that already exists in another `info.py` so the leaderboard finds its logo. A new organization has no logo yet, and the leaderboard shows its initial instead: ask the user for one (square SVG or PNG of at least 128 px, transparent background, readable on a dark background) and say in the PR description that it is attached there. The file goes to the leaderboard Space at the next `update-leaderboard`, not into this repository.
+
+Leave `leakage_evidence` / `leakage_datasets` unset. They record proven leakage of test data into a model's training (a link to the evidence, and the datasets it is proven on), which a maintainer sets later on the `ModelDescriptor` when such evidence turns up (LimiX-2, autogluon/tabarena#648): the leaderboard then warns about the model and every entrant pool gets a twin computed without it.
+
 **When you set `ag_key`/`model_key` here, also classify the model in `get_model_family` (Step 4d)** — those keys decide the model's leaderboard family, and skipping this makes it show as ❓ Other on the website.
 
 ### 3e. Multi-file support code (optional)
@@ -166,9 +209,9 @@ If the wrapper needs helper modules (preprocessors, vendored upstream code, larg
 
 Both subfolders need their own empty `__init__.py`. Import them from `model.py` via absolute paths, e.g. `from tabarena.models.{ModelKey}._internal.preprocessing import Preprocessor`.
 
-### 3f. Test config (no per-model test file)
+### 3f. Test config and the model's own tests
 
-There is **no per-model test file**. `tests/tabarena/models/test_all_models.py`
+There is **no per-model test file in `tests/`**. `tests/tabarena/models/test_all_models.py`
 is parametrized over the model registry, so it fits the new model automatically once
 its `info.py` is discoverable. It skips on `ImportError` (optional dep missing) and for
 GPU-only models without CUDA.
@@ -180,6 +223,16 @@ a speed-up: add one entry to `SMOKE_OVERRIDES`, keyed by the model's `MethodMeta
 fits fine with default hyperparameters on all problem types, add nothing. A wrapper that declares its
 cheapness knobs as the `cheap_hyperparameters` ClassVar (Step 3g) needs no entry either: `smoke_for`
 merges them into the smoke config and the warm-up dummy fit uses the same dict.
+
+Tests specific to the wrapper (a helper's edge cases, an equivalence check between two code paths, a
+save and load round trip) go into the model's own folder, never into `tests/`:
+`packages/tabarena/src/tabarena/models/{ModelKey}/tests/test_*.py` plus an empty `__init__.py`. Neither
+the default `pytest` (`testpaths = ["tests"]`) nor CI collects them, and the wheel leaves them out.
+Run them while working on the model: `pytest packages/tabarena/src/tabarena/models/{ModelKey}/tests`.
+Don't mark them `models` (the default `-m 'not models'` would deselect them on an explicit run too),
+skip on a missing optional dependency with `pytest.importorskip`, and write fit artifacts to `tmp_path`.
+`models/kumo_tabular/tests/` is an example. Add such tests only for logic the registry fit test does not
+reach; most models need none.
 
 ### 3g. Warm-up (untimed environment warm-up): decide, don't skip
 
@@ -210,7 +263,7 @@ order for every model; a new model declares only what the generic layers cannot 
 |---|---|
 | sklearn-like or lightweight | Nothing; the dummy fit covers it. |
 | Torch model on `AbstractTorchModel` | `warmup_modules` with the heavy extra imports (`transformers`, ...). |
-| Torch-backed model on `AbstractModel` | `warmup_modules = ("torch", "yourlib")`. References: `modernnca`, `xrfm`, `tabstar`. |
+| Torch-backed model on `AbstractModel` | `warmup_modules = ("torch", "yourlib")`. References: `modernnca`, `xrfm`. |
 | Library JIT-compiles kernels (numba, JAX, custom CUDA) | A `warmup` classmethod calling the library's pre-compile entry point when one exists (`chimeraboost`, whose `warmup()` needs `chimeraboost>=0.14.1`). Ask the user for the entry point and minimum version when the docs do not say. |
 | Foundation model with pretrained weights | A `shared_weights` declaration (below) plus `warmup_modules` for the library. |
 | The library itself blocks the warm-up or the sharing (import-time global side effect, lazy load at the first predict, load inside `__init__`, leaked global state) | A developer fix (below): the smallest workaround, headed `Developer fix`, with the upstream ask written down. |
@@ -242,7 +295,7 @@ when the library ships it. TabDPT is the precedent: its constructor replica link
 layer6ai-labs/TabDPT-inference#79, and once that merged `tabdpt/model.py` declared the upstream
 `_load_model` like TabICL, with the extra moved to the first release that carries it (`tabdpt>=1.3.1`).
 `grep -rn "Developer fix" packages/tabarena/src/tabarena/models` lists what is outstanding.
-Report every developer fix you add in Step 8.
+Report every developer fix you add in Step 9.
 
 **Foundation models share one network.** A bagged fit of an in-context model would otherwise build
 the same frozen network once per fold child and once more for the refit child, inside the timed fit.
@@ -321,7 +374,7 @@ each timed section still imported. `pytest -m models tests/tabarena/models/test_
 asserts the same per registered model; `allowed_lazy_imports` on `ModelSmokeTest` is the escape
 hatch and needs a comment. Both see the main process only: parallel Ray fold workers start cold, and
 code vendored under `tabarena.models` is invisible to the diff. Report the warm-up decision and this
-limitation in Step 8.
+limitation in Step 9.
 
 ## Step 4: Edit existing files
 
@@ -425,7 +478,17 @@ ruff check --fix packages/tabarena/src/tabarena/models/{ModelKey}/
 
 Fix any reported issues.
 
-## Step 7: Arena registration (optional — only if the model has been benchmarked)
+## Step 7: Review with independent agents
+
+Have the integration checked by reviewers who did not write it. Follow
+`references/model_review.md`: start one `general-purpose` agent per lens (leakage and cheating;
+protocol and fairness; the wrapper's data path) in a single message, give each the wrapper folder,
+the library unpacked at the pinned version, the paper's evaluation notes and its section of the
+checklist, and leave your own conclusions out of the brief. Then read every cited line yourself,
+mark each finding confirmed, plausible or rejected, fix the confirmed ones in the wrapper, and take
+library-level findings to the maintainer. The review's outcome goes into the Report.
+
+## Step 8: Arena registration (optional — only if the model has been benchmarked)
 
 If the model already has processed + uploaded benchmark results, register it in the arena collection so it appears in the benchmark. For the default `tabarena` arena, edit `packages/tabarena/src/tabarena/contexts/tabarena/methods.py` (read it first):
 
@@ -436,20 +499,23 @@ This mirrors the **`upload-method`** skill's registration step — use that skil
 
 **If the model has not been benchmarked yet, skip this step entirely** — `info.py` already declares the metadata for the registry; the collection entry is only needed when results artifacts actually exist.
 
-## Step 8: Report
+## Step 9: Report
 
 Summarize what was created/edited:
 - List new files created
 - List files edited and what was added
 - The warm-up decision (Step 3g): what is warmed and why (or why nothing is needed), any open
   question for the user (library warm-up entry point / version), and the worker-process limitation
+- The review (Step 7): the confirmed and plausible findings with what was done about each, the
+  rejected ones in a line each, and the lenses that came back clean
 - Note any TODOs left for the user (e.g., implementing `_predict_proba` if the library API is unclear, tuning `ag_priority`, adding a real search space later, registering benchmark artifacts after a real run)
 
-When asked to open the PR, use `.github/pull_request_template.md`: a two-to-four sentence summary,
+When asked to open the PR, start its body with `🤖 Generated with [Claude Code](https://claude.com/claude-code)` (unless the user says otherwise) and use
+`.github/pull_request_template.md`: a two-to-four sentence summary,
 everything longer inside the collapsed `<details><summary>Details</summary>` block, the commands run
 under Tests. Fill in the "Model or system submission" section for a model (delete the system lines)
 and keep the closing contribution line. Do not paste this Report into the PR body; the Report is for
-the chat, the PR body is for the reviewers. State the TabArena-Lite (or BeyondArena `core`) results
+the chat, the PR body is for the reviewers. State the TabArena-Lite (or BeyondArena `core2k`) results
 with the hardware and the entry-point script if they exist; if they do not, say so, since a
 maintainer will ask (TabArena verifies submitted results by re-running them, it does not benchmark
 on request). Questions go through the issue forms in `.github/ISSUE_TEMPLATE/`.

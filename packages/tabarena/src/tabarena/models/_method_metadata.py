@@ -255,6 +255,14 @@ class MethodMetadata:
     #: Purely informative; the leaderboard shows it on hover so a reader can see *why* a method
     #: carries the non-commercial marker.
     license: str | None = None
+    #: Whether the method fits inside its prediction call: its fit returns at once and the
+    #: measured ``time_infer_s`` holds the whole fit, as with a hosted API that fits and predicts
+    #: in one request. Results loaded from the results tables then charge that call to the train
+    #: time too (``time_train_s + time_infer_s``), so the train time reads as the time from
+    #: training data to predictions, as it does for every other method, instead of near zero.
+    #: The predict time stays as measured: every new prediction pays for the fit again. The
+    #: hosted tables keep the raw times.
+    fits_at_predict: bool = False
     #: Storage backend for this method's artifacts. ``None`` (the default) infers it in
     #: :meth:`__post_init__`: ``"r2"`` when ``cache_kwargs`` carries a remote location
     #: (``bucket`` + ``prefix``), else ``"local"``. ``"s3"``/``"r2"`` require that location;
@@ -282,6 +290,21 @@ class MethodMetadata:
     #: anchored to :attr:`reference_url`. Validated in :meth:`__post_init__` when set.
     date_introduced: str | None = None
     reference_url: str | None = None
+    #: Who develops the method: a company, lab or university, as a reader would name it
+    #: (``"Prior Labs"``, ``"Yandex"``, ``"University of Washington"``); a classical method names
+    #: where it was introduced, a library baseline the library. The leaderboard shows it as a logo
+    #: next to the method's name. ``None`` (the default) when unknown, e.g. a solo author's
+    #: package.
+    organization: str | None = None
+    #: Where the evidence is that test data leaked into the method's training, such as a GitHub issue
+    #: or a paper's appendix; ``None`` (the default) when there is none. A method with it carries the
+    #: leaderboard's leakage warning, and every entrant pool has a twin computed without it
+    #: (:class:`~tabarena.evaluation.entrants.EntrantPool`). Proven on some datasets means any other
+    #: could be affected too, so the warning covers all its results.
+    leakage_evidence: str | None = None
+    #: The test datasets the evidence proves the leakage on, by dataset name. Needs
+    #: :attr:`leakage_evidence`. Normalized to a sorted, deduped tuple like :attr:`tags`.
+    leakage_datasets: tuple[str, ...] = ()
     display_name: str | None = None
     #: Whether this method's results are verified / signed-off. Default ``True``; set ``False`` for
     #: methods that are not yet verified (e.g. newly-added or not-yet-released models). A manual
@@ -339,9 +362,33 @@ class MethodMetadata:
             raise AssertionError(
                 f"commercial_use must be a bool, got {self.commercial_use!r} (method={self.method!r})."
             )
+        if not isinstance(self.fits_at_predict, bool):
+            raise AssertionError(
+                f"fits_at_predict must be a bool, got {self.fits_at_predict!r} (method={self.method!r})."
+            )
         if self.license is not None and not (isinstance(self.license, str) and self.license):
             raise AssertionError(
                 f"license must be a non-empty string or None, got {self.license!r} (method={self.method!r})."
+            )
+        if self.organization is not None and not (isinstance(self.organization, str) and self.organization):
+            raise AssertionError(
+                f"organization must be a non-empty string or None, got {self.organization!r} (method={self.method!r})."
+            )
+        if self.leakage_evidence is not None and not (isinstance(self.leakage_evidence, str) and self.leakage_evidence):
+            raise AssertionError(
+                f"leakage_evidence must be a non-empty string or None, got {self.leakage_evidence!r} "
+                f"(method={self.method!r})."
+            )
+        # A list from YAML or a caller becomes the same sorted tuple, as `tags` does.
+        self.leakage_datasets = tuple(sorted(set(self.leakage_datasets or ())))
+        if any(not (isinstance(name, str) and name) for name in self.leakage_datasets):
+            raise AssertionError(
+                f"leakage_datasets must be non-empty dataset names, got {self.leakage_datasets!r} "
+                f"(method={self.method!r})."
+            )
+        if self.leakage_datasets and self.leakage_evidence is None:
+            raise AssertionError(
+                f"leakage_datasets needs leakage_evidence, the link to the evidence (method={self.method!r})."
             )
         # When set, `date` must be a real calendar date in YYYY-MM-DD format.
         if self.date is not None:
@@ -981,7 +1028,7 @@ class MethodMetadata:
     def _load_results_file(self, path: Path, download: str | bool) -> pd.DataFrame:
         if download == "auto":
             self._refresh_stale_results(path)
-        return self._load_artifact(
+        df_results = self._load_artifact(
             kind="results",
             load=lambda: pd.read_parquet(path=path),
             own_path=True,
@@ -990,6 +1037,10 @@ class MethodMetadata:
             hosted=self.has_results,
             fetch=lambda downloader: downloader.download_results(),
         )
+        if self.fits_at_predict:
+            # The fit happens inside the prediction call, so that call is charged to the train time too.
+            df_results = df_results.assign(time_train_s=df_results["time_train_s"] + df_results["time_infer_s"])
+        return df_results
 
     def _refresh_stale_results(self, path: Path):
         """Re-download the results tables when the local table at ``path`` differs from its committed checksum.
@@ -1447,13 +1498,19 @@ class ModelDescriptor:
     #: the model (the same weights and code are benchmarked in every run), so declared here once.
     commercial_use: bool = True
     license: str | None = None
+    #: See :attr:`MethodMetadata.organization`.
+    organization: str | None = None
+    #: See :attr:`MethodMetadata.leakage_evidence` / :attr:`MethodMetadata.leakage_datasets`. Intrinsic to
+    #: the weights, so every run of the model carries it.
+    leakage_evidence: str | None = None
+    leakage_datasets: tuple[str, ...] = ()
 
     def method_metadata(self, *, method: str, **kwargs) -> MethodMetadata:
         """Build a :class:`MethodMetadata` for one benchmark run of this model.
 
         The descriptor's intrinsic fields (``display_name``, ``compute``, ``is_bag``,
-        ``reference_url``, ``date_introduced``, ``commercial_use``, ``license``) are supplied as
-        defaults; pass any of them in ``**kwargs`` to
+        ``reference_url``, ``date_introduced``, ``commercial_use``, ``license``, ``organization``,
+        ``leakage_evidence``, ``leakage_datasets``) are supplied as defaults; pass any of them in ``**kwargs`` to
         override for a variant (e.g. a CPU build of a GPU model, which keeps the same paper
         but a different ``display_name`` and ``compute``). All other (run-specific)
         :class:`MethodMetadata` fields come from ``**kwargs``.
@@ -1475,6 +1532,9 @@ class ModelDescriptor:
             date_introduced=self.date_introduced,
             commercial_use=self.commercial_use,
             license=self.license,
+            organization=self.organization,
+            leakage_evidence=self.leakage_evidence,
+            leakage_datasets=self.leakage_datasets,
         )
         # Caller-provided values win, so a variant can override an intrinsic default.
         return MethodMetadata.config(method=method, **{**fields_from_descriptor, **kwargs})

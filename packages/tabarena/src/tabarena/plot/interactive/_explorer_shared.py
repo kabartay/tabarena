@@ -18,7 +18,7 @@ import html
 import json
 from typing import TYPE_CHECKING
 
-from tabarena.plot.plot_pareto_focus import FAMILY_COLORS, marker_edge_color
+from tabarena.plot.plot_pareto_focus import FAMILY_COLORS, SYSTEM_SHADE_COLORS, marker_edge_color
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -33,17 +33,24 @@ _FAMILY_CSS_TOKENS: dict[str, str] = {
     "Other": "--fam-other",
 }
 
+#: System shade (a key of :data:`SYSTEM_SHADE_COLORS`) -> the CSS custom property carrying it.
+_SHADE_CSS_TOKENS: dict[str, str] = {
+    "with-llm": "--fam-system-llm",
+    "closed-source-api": "--fam-system-api",
+}
+
 
 def _family_css_vars() -> str:
     """CSS custom-property lines carrying the shared family colors.
 
     ``--fam-<key>`` is the family color. ``--fam-<key>-edge`` is the edge an emphasized marker
     draws on the light surface: the family color darkened as in the static figures. Dark mode
-    overrides the edge tokens.
+    overrides the edge tokens. The system shades get the same pair.
     """
+    colors = [(token, FAMILY_COLORS[family]) for family, token in _FAMILY_CSS_TOKENS.items()]
+    colors += [(token, SYSTEM_SHADE_COLORS[shade]) for shade, token in _SHADE_CSS_TOKENS.items()]
     lines = []
-    for family, token in _FAMILY_CSS_TOKENS.items():
-        color = FAMILY_COLORS[family]
+    for token, color in colors:
         lines.append(f"    {token}: {color};")
         lines.append(f"    {token}-edge: {marker_edge_color(color)};")
     return "\n".join(lines)
@@ -120,6 +127,8 @@ _DARK_TOKENS = """
     --fam-nn-edge: var(--card);
     --fam-tree-edge: var(--card);
     --fam-system-edge: var(--card);
+    --fam-system-llm-edge: var(--card);
+    --fam-system-api-edge: var(--card);
     --fam-baseline-edge: var(--card);
     --fam-other-edge: var(--card);
     --var-default: #4386d5;
@@ -147,8 +156,9 @@ def _scope(selector: str, *bodies: str, indent: str = "  ") -> str:
 #:
 #: Four scopes, in this order: the base (light) scope carries the family colors
 #: and their marker-edge tokens; the media query follows the OS preference;
-#: ``[data-theme="dark"]`` lets an embedding page force dark (the always-dark
-#: leaderboard Space does); and ``[data-theme="light"]`` forces light for the
+#: ``[data-theme="dark"]`` lets an embedding page force dark (the leaderboard
+#: Space passes its theme in the frame URL's hash, see ``HASH_THEME`` in
+#: EXPLORER_BASE_JS); and ``[data-theme="light"]`` forces light for the
 #: paper view, beating both the media query (lower specificity) and the dark
 #: stamp (same specificity, later). It repeats the family tokens so the light
 #: edge tokens win there too.
@@ -178,6 +188,12 @@ EXPLORER_BASE_CSS = "".join(
   /* The [hidden] attribute must beat author display rules (e.g. the
      inline-flex on .metricpick), else hidden controls render empty. */
   [hidden] { display: none !important; }
+  /* A method with a leakage warning (`leakageOf`): a red badge after its name in the table. */
+  .leak-tag {
+    display: inline-block; margin-left: 4px; padding: 0 6px; border-radius: 4px;
+    background: #d6363c; color: #fff; font-size: 10.5px; font-weight: 800; letter-spacing: 0.04em;
+    text-transform: uppercase; vertical-align: 1px; white-space: nowrap;
+  }
 
   .explorer-title { font-size: 15px; font-weight: 650; margin: 0 0 8px; }
   .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 10px; }
@@ -309,6 +325,26 @@ EXPLORER_BASE_CSS = "".join(
 #: above the splice point), so a template can use both before its own setup runs.
 EXPLORER_BASE_JS = r"""
   const NS = "http://www.w3.org/2000/svg";
+  // Methods with a leakage warning: test data is proven to have leaked into their training on some
+  // datasets, so any of their results may be too good. The website's converter writes them into the
+  // page (`window.TABARENA_LEAKAGE`, method -> the datasets it is proven on; `inject_leakage`), and
+  // every chart puts the mark after their name wherever it shows one. A name may carry its variant
+  // ("LimiX-2 (default)"), so a flagged method matches with or without it.
+  const LEAKAGE = new Map(Object.entries(window.TABARENA_LEAKAGE || {}));
+  const LEAKAGE_MARK = " \u26a0\ufe0e";
+  function leakageOf(name) {
+    for (const [method, datasets] of LEAKAGE) {
+      if (name === method || String(name).startsWith(method + " (")) return datasets;
+    }
+    return null;
+  }
+  function leakageMark(name) { return leakageOf(name) ? LEAKAGE_MARK : ""; }
+  // The embedding page's theme. The leaderboard loads each page from its URL with `#theme=dark` or
+  // `#theme=light`, read here before any chart is drawn; a page embedded as srcdoc carries a
+  // `data-theme` stamp instead, and standalone there is neither, so the viewer's OS preference
+  // applies (see the scopes in EXPLORER_BASE_CSS).
+  const HASH_THEME = (/(?:^#|&)theme=(dark|light)\b/.exec(location.hash) || [])[1];
+  if (HASH_THEME) document.documentElement.setAttribute("data-theme", HASH_THEME);
   // Baseline and Other are one bucket, as in the site's own type legend: they
   // already share a color, and each holds only a handful of methods.
   const FAM_MERGED = "Baseline / Other";
@@ -365,6 +401,45 @@ EXPLORER_BASE_JS = r"""
     "System": "var(--fam-system-edge)",
     [FAM_MERGED]: "var(--fam-baseline-edge)",
   };
+
+  // A system's shade (its `shade`, a tag from website_format.SYSTEM_SHADE_TAGS): the System colour
+  // one step darker the less of the system can be inspected. A record without one takes its
+  // family's colours. Like the System colour, a shade is its own text colour on both surfaces.
+  const SHADE_ORDER = ["with-llm", "closed-source-api"];
+  const SHADE_VAR = {
+    "with-llm": "var(--fam-system-llm)",
+    "closed-source-api": "var(--fam-system-api)",
+  };
+  const SHADE_EDGE = {
+    "with-llm": "var(--fam-system-llm-edge)",
+    "closed-source-api": "var(--fam-system-api-edge)",
+  };
+  const SHADE_LABEL = {
+    "with-llm": "System with LLMs",
+    "closed-source-api": "Closed-source API system",
+  };
+  // Mark, text and marker-edge colour of one record (a point, a method, a label).
+  const famColor = (r) => SHADE_VAR[r.shade] || FAM_VAR[r.family];
+  const famInk = (r) => SHADE_VAR[r.shade] || FAM_INK[r.family];
+  const famEdge = (r) => SHADE_EDGE[r.shade] || FAM_EDGE[r.family];
+  // What a tooltip names as the record's kind: its shade's label, or its family.
+  const famLabel = (r) => SHADE_LABEL[r.shade] || r.family;
+
+  // The colours a family legend names for `records`: each family present, with the shade of each
+  // kind of system present right after System, which itself appears only for an unshaded one.
+  function legendSwatches(records) {
+    const out = [];
+    for (const fam of FAM_ORDER) {
+      const members = records.filter(r => r.family === fam);
+      if (members.some(r => !SHADE_VAR[r.shade])) out.push({ label: fam, color: FAM_VAR[fam], ink: FAM_INK[fam] });
+      for (const shade of SHADE_ORDER) {
+        if (members.some(r => r.shade === shade)) {
+          out.push({ label: SHADE_LABEL[shade], color: SHADE_VAR[shade], ink: SHADE_VAR[shade] });
+        }
+      }
+    }
+    return out;
+  }
 
   // Create an SVG element with attributes, optionally appended to `parent`.
   function el(name, attrs, parent) {
@@ -491,8 +566,9 @@ EXPLORER_BASE_JS = r"""
     // The embedding page's choice, read before this function touches the stamp. Captured here
     // and not on entering paper view: a page that opens *out* of paper view (the tables, where
     // the controls are the point) would otherwise clear the stamp on its very first call and
-    // then follow the viewer's OS preference — rendering light inside the always-dark site.
-    const hostTheme = root.getAttribute("data-theme");
+    // then follow the viewer's OS preference rather than the site's theme. A
+    // `tabarena-explorer-theme` message replaces it when the reader switches the site's theme.
+    let hostTheme = root.getAttribute("data-theme");
     const btn = document.getElementById("btn-paper");
     const embedded = window.parent !== window;
 
@@ -518,6 +594,11 @@ EXPLORER_BASE_JS = r"""
     window.addEventListener("message", ev => {
       const d = ev.data;
       if (d && d.type === "tabarena-explorer-paper" && typeof d.on === "boolean") setPaper(d.on);
+      if (d && d.type === "tabarena-explorer-theme" && (d.theme === "dark" || d.theme === "light")) {
+        hostTheme = d.theme;
+        // Paper view stays white; the edit view takes the new theme at once.
+        if (!document.body.classList.contains("paper")) setPaper(false);
+      }
     });
     // Only standalone: embedded, the host owns the button and would not see the
     // key press, so its label would fall out of step with the frame.
@@ -636,6 +717,27 @@ EXPLORER_BASE_JS = r"""
     document.body.appendChild(a);
     a.click();
     a.remove();
+  }
+
+  // "Save view" (`#btn-save-view`) downloads the page as it loaded (`pristine`: a copy of the
+  // document taken before any script changed it) with `getView()` written into its `#saved-view`
+  // block, so the file opens on the current view and stays editable; at load, a saved view is handed
+  // to `applyView`. The JSON escapes "<", so no view can close the block's script element early.
+  function setUpSaveView(pristine, getView, applyView, filename) {
+    let saved = null;
+    try {
+      saved = JSON.parse(document.getElementById("saved-view").textContent);
+    } catch (e) {
+      saved = null;
+    }
+    if (saved) applyView(saved);
+    document.getElementById("btn-save-view").addEventListener("click", () => {
+      const page = pristine.cloneNode(true);
+      page.querySelector("#saved-view").textContent = JSON.stringify(getView()).replace(/</g, "\\u003c");
+      const url = URL.createObjectURL(new Blob(["<!doctype html>\n" + page.outerHTML], { type: "text/html" }));
+      downloadUrl(url, filename() + ".html");
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
   }
 
   // Rasterize the export SVG into a canvas at `scale`, then hand it to `done`.
@@ -763,10 +865,6 @@ EXPLORER_BASE_JS = r"""
     });
   }
 
-  // When embedded, report the content height so the host page can size the
-  // iframe to fit (avoids an inner scrollbar). Works from a sandboxed frame.
-  // Measure the body (viewport-independent) — documentElement.scrollHeight is
-  // clamped to at least the iframe's current viewport, which turns the
   // Embedded, the host can take methods out of the page altogether: the leaderboard's
   // "Include non-commercial methods" toggle. This is stronger than a chip toggle, which only
   // greys a method out and leaves it one click away: an excluded method is dropped from the
@@ -787,6 +885,56 @@ EXPLORER_BASE_JS = r"""
     });
   }
 
+  // Embedded, the host can ask every chart of the page to follow some methods (the leaderboard's
+  // "Follow" picker): each chart keeps them highlighted, whatever its own controls select, and
+  // marks them in its own way. Names as in `onExcludeMessage`; a repeat of the current set is
+  // ignored, so the host can re-send it with every height report.
+  function onFollowMessage(apply) {
+    let current = null;
+    window.addEventListener("message", ev => {
+      const d = ev.data;
+      if (!d || d.type !== "tabarena-explorer-follow" || !Array.isArray(d.methods)) return;
+      const names = d.methods.filter(m => typeof m === "string").sort();
+      const key = names.join("\u0000");
+      if (key === current) return;
+      current = key;
+      apply(new Set(names));
+    });
+  }
+
+  // Linked hover. The method under the reader's pointer goes up to the host, which hands it to the
+  // other charts of the page as `tabarena-explorer-hovered`, so one method lights up in each of
+  // them at once; `null` when the pointer leaves. Posted only on a change, since pointer events
+  // fire per pixel.
+  let lastHover = null;
+  function postHover(method) {
+    if (window.parent === window || method === lastHover) return;
+    lastHover = method;
+    window.parent.postMessage({ type: "tabarena-explorer-hover", method: method }, "*");
+  }
+  function onHoverMessage(apply) {
+    window.addEventListener("message", ev => {
+      const d = ev.data;
+      if (d && d.type === "tabarena-explorer-hovered") apply(typeof d.method === "string" ? d.method : null);
+    });
+  }
+
+  // A click on a method's marks (a point, a bar, a label, a row). Embedded, it asks the host to
+  // follow the method, or to stop following it, on every chart of the page; the host answers with
+  // `tabarena-explorer-follow` to every frame, this one included. Standalone there is no host, and
+  // `local` (the chart's own toggle) runs instead. The chips keep their local role either way.
+  const EMBEDDED = window.parent !== window;
+  function pickMethod(method, local) {
+    if (EMBEDDED) window.parent.postMessage({ type: "tabarena-explorer-pick", method: method }, "*");
+    else if (local) local();
+  }
+  // The tooltip line saying so, empty standalone.
+  const PICK_HINT = EMBEDDED ? '<div class="t-var">Click to follow it in every chart</div>' : "";
+
+  // When embedded, report the content height so the host page can size the
+  // iframe to fit (avoids an inner scrollbar). Works from a sandboxed frame.
+  // Measure the body (viewport-independent) — documentElement.scrollHeight is
+  // clamped to at least the iframe's current viewport, which turns the
   // resize round-trip into a grow-forever feedback loop. The change guard
   // stops re-posting once the height settles.
   let lastPostedHeight = 0;
@@ -798,6 +946,20 @@ EXPLORER_BASE_JS = r"""
     window.parent.postMessage({ type: "tabarena-explorer-height", height: height }, "*");
   }
 """
+
+
+def inject_leakage(page: str, leakage: dict[str, list[str]]) -> str:
+    """``page`` with the methods that carry a leakage warning written into its head.
+
+    ``leakage`` maps a method, by the name the charts key it on (its display name without the
+    variant), to the datasets the leakage is proven on. Every explorer's shared script reads it
+    (`leakageOf`) and marks those methods wherever it names them. A page with nothing to mark is
+    returned unchanged.
+    """
+    if not leakage:
+        return page
+    data = json.dumps(leakage, sort_keys=True).replace("</", "<\\/")
+    return page.replace("<head>", f"<head>\n<script>window.TABARENA_LEAKAGE = {data};</script>", 1)
 
 
 def render_explorer_html(

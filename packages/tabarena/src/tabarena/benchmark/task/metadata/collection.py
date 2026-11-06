@@ -330,6 +330,15 @@ class TaskMetadataCollection:
                 new_tasks.append(replace(t, splits_metadata=kept))
         return self._with_tasks(new_tasks)
 
+    def subset_to_tids(self, tids: Iterable[int]) -> TaskMetadataCollection:
+        """A new collection with the tasks whose integer ``tid`` (as in :meth:`dataset_to_tid`) is in ``tids``.
+
+        A ``tid`` the collection does not have is ignored, like the ``tid`` filter repo generation
+        applies to raw results.
+        """
+        tids = set(tids)
+        return self._with_tasks([t for t in self._tasks if tid_from_task_id_str(t.task_id_str) in tids])
+
     def subset_to_jobs(self, jobs: list[Job]) -> TaskMetadataCollection:
         """A new collection restricted to the ``(dataset, fold, repeat)`` splits the ``jobs`` touch.
 
@@ -480,16 +489,23 @@ class TaskMetadataCollection:
         return self._with_tasks(new_tasks)
 
     def _filter_dataset_names(self, dataset_names: list[str]) -> TaskMetadataCollection:
-        """Keep tasks whose ``dataset_name`` is listed; raise on names not in the collection."""
+        """Keep tasks whose ``dataset_name`` or ``tabarena_task_name`` is listed; raise on names not in the collection.
+
+        Both names are accepted because they differ for a ``UserTask`` (``tabarena_task_name`` carries a hash
+        suffix, ``<name>-<hash>``), and :meth:`dataset_names` and a results frame's ``dataset`` column use the
+        ``tabarena_task_name``.
+        """
         requested = set(dataset_names)
-        available = {t.dataset_name for t in self._tasks}
+        available = {t.dataset_name for t in self._tasks} | {t.tabarena_task_name for t in self._tasks}
         missing = requested - available
         if missing:
             raise ValueError(
                 f"Requested dataset names not found in task metadata: {sorted(missing)}. "
-                f"Available dataset names: {sorted(available)}",
+                f"Available dataset names: {sorted({t.dataset_name for t in self._tasks})}",
             )
-        return self._with_tasks([t for t in self._tasks if t.dataset_name in requested])
+        return self._with_tasks(
+            [t for t in self._tasks if t.dataset_name in requested or t.tabarena_task_name in requested]
+        )
 
     def _filter_task_ids(self, task_ids: list[str | int]) -> TaskMetadataCollection:
         """Keep tasks whose ``task_id_str`` is listed; raise on ids not in the collection."""

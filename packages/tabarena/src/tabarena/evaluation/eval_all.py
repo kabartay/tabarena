@@ -11,7 +11,7 @@ import itertools
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from tabarena.evaluation.entrants import filter_results_to_pool, get_entrant_pool
+from tabarena.evaluation.entrants import filter_results_to_pool, get_entrant_pool, has_leakage_warning
 from tabarena.evaluation.leaderboard_reporter import LeaderboardReporter
 from tabarena.evaluation.subset_grid import get_all_subset_combinations, get_website_folder_name
 from tabarena.utils.parallel_for import parallel_for
@@ -142,7 +142,11 @@ def get_pool_reference_lines(
             row.display_name
             for row in method_metadata_info.itertuples()
             if getattr(row, "method_class", "model") == "system"
-            and pool.admits("system", getattr(row, "tags", ()) or ())
+            and pool.admits(
+                "system",
+                getattr(row, "tags", ()) or (),
+                leakage=has_leakage_warning(getattr(row, "leakage_evidence", None)),
+            )
         )
     )
     colors = list(itertools.islice(itertools.cycle(_REFERENCE_LINE_COLORS), len(names)))
@@ -165,7 +169,15 @@ def evaluate_single(
     elo_bootstrap_rounds: int = 200,
     custom_folder_name: str | None = None,
     website_only: bool = False,
+    static_figures: str = "all",
+    verbose: bool = True,
 ):
+    """Evaluate one cell of the subset grid and write its artifacts under ``eval_save_path``.
+
+    ``static_figures`` and ``verbose`` go to :meth:`LeaderboardReporter.eval`: the website build
+    passes ``"uncovered"`` and ``False``, since it publishes the interactive pages only and runs
+    every cell of the grid.
+    """
     from tabarena.nips2025_utils.compare import subset_tasks
 
     df_results = df_results.copy()
@@ -270,6 +282,8 @@ def evaluate_single(
         # so moved every other number, while the figures pretended it was not there. A pool that
         # admits no system has no baseline row, so this is a no-op for models-only.
         plot_with_baselines=True,
+        static_figures=static_figures,
+        verbose=verbose,
         **eval_kwargs,
     )
 

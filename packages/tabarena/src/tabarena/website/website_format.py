@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from functools import partial
 from typing import TYPE_CHECKING
 
@@ -8,7 +9,7 @@ import pandas as pd
 from tabarena.models._method_metadata import MethodMetadata
 
 if TYPE_CHECKING:
-    from collections.abc import Container
+    from collections.abc import Container, Iterable
 
 
 class Constants:
@@ -50,8 +51,9 @@ TAG_SPECS: dict[str, dict[str, str]] = {
         "emoji": "🔒",
         "label": "closed-source API",
         "hint": (
-            "This system runs behind a remote API whose internals cannot be inspected, and whose "
-            "behaviour can change between runs."
+            "This system runs on its provider's servers. We cannot see what it does with the data "
+            "we send, test features included, and it can change between runs. Its train and predict "
+            "times are not comparable with the models'. Do not trust these results by default."
         ),
     },
 }
@@ -138,6 +140,7 @@ def get_model_family(model_name: str, system_names: Container[str] = frozenset()
             "PERPETUALBOOSTER",
             "CHIMERA",
             "CTB",
+            "PRISMBOOST",
         ],
         Constants.foundational: [
             "CAUSILO",
@@ -170,6 +173,11 @@ def get_model_family(model_name: str, system_names: Container[str] = frozenset()
             "TABSWIFT",
             "EXAONE",
             "XIAOMI-TABLDM",
+            "TA-KUMO-TABULAR",
+            "TA-SELDON",
+            "FTFM",
+            "LIGHTPFN",
+            "TABABAX",
         ],
         Constants.baseline: ["KNN", "LR", "LINEAR"],
         Constants.other: ["XRFM", "APLR"],
@@ -198,6 +206,38 @@ def system_display_names(method_metadata_info: pd.DataFrame | None) -> frozenset
         return frozenset()
     is_system = method_metadata_info["method_class"] == "system"
     return frozenset(method_metadata_info.loc[is_system, "display_name"].dropna())
+
+
+#: Tags that shade a system's color, in precedence order: a system carrying several takes the
+#: first. Each step darkens the System orange, the less of the system can be inspected, and an
+#: untagged system keeps the plain family color. The colors are
+#: :data:`tabarena.plot.plot_pareto_focus.SYSTEM_SHADE_COLORS`.
+SYSTEM_SHADE_TAGS: tuple[str, ...] = ("closed-source-api", "with-llm")
+
+
+def system_shade(tags: Iterable[str] | str | None) -> str | None:
+    """The tag that shades a system's color, or None when it keeps the plain System color.
+
+    ``tags`` is a tag sequence or one written to CSV: a website frame's semicolon-joined ``Tags``
+    cell, or the tuple repr in a ``method_info.csv``. An empty cell reads back as NaN.
+    """
+    if tags is None or isinstance(tags, float):
+        return None
+    present = set(re.findall(r"[\w-]+", tags) if isinstance(tags, str) else tags)
+    return next((tag for tag in SYSTEM_SHADE_TAGS if tag in present), None)
+
+
+def system_shades(method_metadata_info: pd.DataFrame | None) -> dict[str, str]:
+    """Display name -> :func:`system_shade` of every shaded system in ``method_metadata_info``.
+
+    The counterpart of :func:`system_display_names` for the figure paths, which see only a
+    method's rendered name.
+    """
+    if method_metadata_info is None or not {"method_class", "tags"} <= set(method_metadata_info.columns):
+        return {}
+    systems = method_metadata_info[method_metadata_info["method_class"] == "system"]
+    shades = {name: system_shade(tags) for name, tags in zip(systems["display_name"], systems["tags"], strict=True)}
+    return {name: shade for name, shade in shades.items() if shade is not None and not pd.isna(name)}
 
 
 def get_rename_map() -> dict[str, str]:
@@ -233,6 +273,7 @@ def get_rename_map() -> dict[str, str]:
         "SAP-RPT-OSS": "SAP-RPT-OSS",
         "TABSWIFT": "TabSwift",
         "XIAOMI-TABLDM": "Xiaomi-TabLDM",
+        "TABABAX": "TabAbax",
     }
 
 
@@ -266,6 +307,10 @@ def add_metadata(
                 "Tags": "",
                 "Commercial": True,
                 "License": "",
+                "FitsAtPredict": False,
+                "Organization": "",
+                "Leakage": "",
+                "LeakageDatasets": "",
             },
         )
     metadata = metadata_df.loc[method]
@@ -293,6 +338,21 @@ def add_metadata(
     license_name = metadata.get("license", None)
     if license_name is None or pd.isna(license_name):
         license_name = ""
+    # Frames written before the field existed lack it; that reads as a separate fit and predict.
+    fits_at_predict = metadata.get("fits_at_predict", False)
+    if fits_at_predict is None or pd.isna(fits_at_predict):
+        fits_at_predict = False
+    # Likewise for frames written before the organization field; "" when unknown.
+    organization = metadata.get("organization", None)
+    if organization is None or pd.isna(organization):
+        organization = ""
+    # And for frames written before the leakage fields; "" when the method carries no warning.
+    leakage_evidence = metadata.get("leakage_evidence", None)
+    if leakage_evidence is None or (isinstance(leakage_evidence, float) and pd.isna(leakage_evidence)):
+        leakage_evidence = ""
+    leakage_datasets = metadata.get("leakage_datasets", ())
+    if leakage_datasets is None or isinstance(leakage_datasets, float):
+        leakage_datasets = ()
 
     # Add Model Family Information
     out_dict = {
@@ -304,6 +364,14 @@ def add_metadata(
         "Tags": ";".join(tags),
         "Commercial": bool(commercial_use),
         "License": str(license_name),
+        # Whether the train time includes the prediction call (`MethodMetadata.fits_at_predict`).
+        "FitsAtPredict": bool(fits_at_predict),
+        # Who develops the method (`MethodMetadata.organization`); the leaderboard shows its logo.
+        "Organization": str(organization),
+        # The evidence that test data leaked into its training (`MethodMetadata.leakage_evidence`), and
+        # the datasets it is proven on, semicolon-joined like `Tags`; empty for a method without one.
+        "Leakage": str(leakage_evidence),
+        "LeakageDatasets": ";".join(leakage_datasets),
     }
 
     display_name = MethodMetadata.compute_method_name(
@@ -345,6 +413,10 @@ def legacy_formatting(df_leaderboard: pd.DataFrame) -> pd.DataFrame:
     df_leaderboard["Tags"] = ""
     df_leaderboard["Commercial"] = True
     df_leaderboard["License"] = ""
+    df_leaderboard["FitsAtPredict"] = False
+    df_leaderboard["Organization"] = ""
+    df_leaderboard["Leakage"] = ""
+    df_leaderboard["LeakageDatasets"] = ""
 
     # Add Model Family Information
     df_leaderboard["Type"] = df_leaderboard.loc[:, "method"].apply(
@@ -381,7 +453,21 @@ def format_leaderboard(
         )
         method_info_map = method_info_map.set_index("method")
         df_leaderboard[
-            ["method", "Hardware", "Verified", "Type", "TypeName", "MethodClass", "Tags", "Commercial", "License"]
+            [
+                "method",
+                "Hardware",
+                "Verified",
+                "Type",
+                "TypeName",
+                "MethodClass",
+                "Tags",
+                "Commercial",
+                "License",
+                "FitsAtPredict",
+                "Organization",
+                "Leakage",
+                "LeakageDatasets",
+            ]
         ] = df_leaderboard.apply(
             partial(add_metadata, metadata_df=method_info_map, include_url=include_url),
             result_type="expand",
@@ -446,6 +532,10 @@ def format_leaderboard(
             "Tags",
             "Commercial",
             "License",
+            "FitsAtPredict",
+            "Organization",
+            "Leakage",
+            "LeakageDatasets",
         ],
     ]
 
@@ -466,7 +556,18 @@ def format_leaderboard(
 
     if not include_type:
         df_leaderboard = df_leaderboard.drop(
-            columns=["Type", "TypeName", "MethodClass", "Tags", "Commercial", "License"]
+            columns=[
+                "Type",
+                "TypeName",
+                "MethodClass",
+                "Tags",
+                "Commercial",
+                "License",
+                "FitsAtPredict",
+                "Organization",
+                "Leakage",
+                "LeakageDatasets",
+            ]
         )
 
     if compact:

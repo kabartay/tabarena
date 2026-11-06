@@ -50,7 +50,25 @@ __BASE_CSS__
 
   .pd-page { position: relative; }
 
-  .pd-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin-bottom: 8px; }
+  /* Two rows: the two picks side by side, then the dataset filters. */
+  .pd-controls { display: flex; flex-direction: column; gap: 8px; margin-bottom: 6px; }
+  .pd-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 30px; }
+  .pd-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 16px; }
+  /* The two things to pick, numbered in the order they matter: a method, then a dataset. */
+  .pd-stepgroup { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; min-width: 0; }
+  .pd-step {
+    display: inline-grid; place-items: center; width: 20px; height: 20px; flex: none; border-radius: 50%;
+    font: 700 11.5px/1 system-ui, sans-serif; color: var(--paper); background: var(--accent);
+  }
+  .pd-steplabel { font-size: 12.5px; font-weight: 650; color: var(--ink); }
+  .pd-fchip .n { margin-left: 4px; font-weight: 500; opacity: 0.7; font-variant-numeric: tabular-nums; }
+  .pd-fchip[aria-disabled="true"] { opacity: 0.4; cursor: default; }
+  /* The keys, one hover away rather than a sentence over the list. */
+  .pd-keys {
+    font: 600 11.5px/1 system-ui, sans-serif; color: var(--muted); cursor: help;
+    border: 1px dashed var(--line); border-radius: 999px; padding: 4px 9px;
+  }
+  .pd-keys:hover, .pd-keys:focus-visible { color: var(--ink); border-color: var(--muted); }
   .pd-search {
     font: 500 12.5px/1.2 system-ui, sans-serif; color: var(--ink); background: var(--chip-bg);
     border: 1px solid var(--line); border-radius: 7px; padding: 6px 9px; min-width: 200px; flex: 1 1 200px;
@@ -161,35 +179,44 @@ __BASE_CSS__
     border-radius: 4px; padding: 0 4px; margin-left: 5px; color: #14161a; background: var(--vc);
   }
   .pd-stripcell { width: 250px; padding-top: 0; padding-bottom: 0; }
+  .pd-short { display: none; }
+  .pd-namecell .pd-name { display: inline-block; vertical-align: bottom; }
   /* A system carries its configuration in its name, so the winner cell is bounded and clipped
      rather than allowed to push the table wider than the frame. */
   table.pd-table td:last-child { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
   .pd-stripsvg { display: block; }
-  .pd-hint { font-size: 12px; color: var(--muted); margin: 0 2px 6px; }
-  .pd-hint kbd {
+  .pd-keys kbd {
     font: 600 11px/1 system-ui, sans-serif; border: 1px solid var(--line); border-bottom-width: 2px;
     border-radius: 4px; padding: 2px 5px; background: var(--chip-bg);
   }
 
   /* --- The detail pane ------------------------------------------------------ */
-  .pd-detail { margin-top: 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
-  /* What the dataset *is*, reading as a caption under the chart it describes. The tinted panel
-     is what makes it a block rather than a line of grey text the eye slides past; the facts
-     themselves stay a plain run-on list, which packs far more of them onto a line than pills do.
-     The name leads it, and there is no separate header above the chart: the selected row in the
-     table is already highlighted, so a second copy of the name up there said nothing new. */
-  .pd-about {
-    margin-top: 12px; padding: 8px 11px 9px; border-radius: 9px;
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-    border: 1px solid color-mix(in srgb, var(--accent) 26%, var(--line));
+  /* Two cards, one above the other: what the dataset is, then how the field did on it (the chart
+     and the ranking). With the list beside them, the page holds three. */
+  .pd-detail { margin-top: 12px; display: flex; flex-direction: column; gap: 12px; }
+  .pd-about, .pd-chartcard { border: 1px solid var(--line); border-radius: 10px; background: var(--card); }
+  .pd-about { padding: 9px 14px 10px; }
+  .pd-abouthead { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px; margin-bottom: 6px; }
+  .pd-aboutname { font-size: 15px; font-weight: 700; color: var(--ink); }
+  .pd-aboutsub { font-size: 12px; color: var(--muted); }
+  /* A spec sheet: three groups side by side, each a column of label and value. */
+  .pd-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 6px 22px; margin: 0; }
+  .pd-factgroup { min-width: 0; }
+  .pd-factgroup dl { margin: 0; }
+  .pd-factlabel {
+    display: block; margin-bottom: 2px; font-size: 10.5px; font-weight: 650; letter-spacing: 0.06em;
+    text-transform: uppercase; color: var(--muted);
   }
-  .pd-aboutname { font-size: 13.5px; font-weight: 700; color: var(--ink); }
-  .pd-aboutfacts {
-    display: flex; flex-wrap: wrap; gap: 2px 10px; margin-top: 3px;
-    font-size: 11.5px; color: var(--muted);
+  .pd-factrow {
+    display: flex; justify-content: space-between; gap: 10px; padding: 2px 0; font-size: 12px;
+    border-bottom: 1px dashed color-mix(in srgb, var(--line) 80%, transparent);
   }
-  .pd-aboutfacts .item { white-space: nowrap; }
-  .pd-aboutfacts .item b { color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; }
+  .pd-factrow:last-child { border-bottom: 0; }
+  .pd-factrow dt { color: var(--muted); white-space: nowrap; }
+  .pd-factrow dd {
+    margin: 0; color: var(--ink); font-weight: 620; font-variant-numeric: tabular-nums; text-align: right;
+    min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
   .pd-dbody { display: flex; gap: 14px; align-items: flex-start; padding: 10px 12px 12px; }
   .pd-chartcol { flex: 1 1 auto; min-width: 0; }
   .pd-rankcol { flex: 0 0 268px; min-width: 220px; }
@@ -202,7 +229,9 @@ __BASE_CSS__
      per-dataset page's own. */
   .pd-chartbar .hint, .pd-controls .hint { font-size: 12.5px; color: var(--muted); }
   .pd-empty { color: var(--muted); font-size: 12.5px; font-style: italic; padding: 26px 4px; }
-  .legendstrip .legendbreak { flex-basis: 100%; height: 0; }
+  /* The chart's key, one line in the top rows rather than a block over the chart. */
+  .pd-legend { gap: 4px 14px; font-size: 12px; padding: 0 2px 10px; }
+  .pd-legend .pd-legsep { width: 1px; height: 14px; background: var(--line); }
 
   .pd-ranklist {
     list-style: none; margin: 0; padding: 0; overflow: auto; max-height: 372px;
@@ -236,15 +265,46 @@ __BASE_CSS__
   .pd-rankbar { grid-column: 1 / -1; height: 3px; border-radius: 2px; background: var(--line); overflow: hidden; }
   .pd-rankbar span { display: block; height: 100%; background: var(--fam); opacity: 0.7; }
 
+  /* --- List beside detail ----------------------------------------------------
+     From 1100px the list sits on the left and the chosen dataset on the right, so a click or an
+     arrow key changes what is beside it rather than something further down. The list is taken
+     out of the flow and fills its column, as tall as the detail is; its cells tighten and its
+     long headers shorten so the dataset's size and winner stay in view (the tie count is in the
+     row's hover and the detail), and the detail puts the dataset's facts on top and the ranking
+     under the chart. Narrower, the two stack as before, with the resize handle. */
+  @media (min-width: 1100px) {
+    .pd-main { display: grid; grid-template-columns: minmax(0, 54fr) minmax(0, 46fr); gap: 14px; align-items: stretch; }
+    .pd-main table.pd-table thead th { padding-left: 5px; padding-right: 5px; }
+    .pd-main table.pd-table thead th.sortable::after { margin-left: 2px; }
+    .pd-main table.pd-table td { padding-left: 5px; padding-right: 5px; }
+    .pd-main .pd-full { display: none; }
+    .pd-main .pd-short { display: inline; }
+    .pd-left { position: relative; min-height: 460px; }
+    .pd-left .pd-listbox { position: absolute; inset: 0; }
+    .pd-left .pd-listwrap { height: 100% !important; }
+    .pd-griprow { display: none !important; }
+    .pd-main .pd-wide { display: none; }
+    .pd-namecell .pd-name { max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
+    .pd-stripcell { width: 180px; }
+    .pd-stripsvg { width: 180px; height: auto; }
+    table.pd-table td.pd-winner { max-width: 110px; }
+    .pd-detail { margin-top: 0; }
+    .pd-dbody { flex-direction: column; align-items: stretch; }
+    .pd-rankcol { flex: none; width: 100%; min-width: 0; }
+    .pd-ranklist { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 14px; max-height: 236px; }
+  }
   .chartbox { position: relative; }
   .chartbox svg { display: block; }
   body.paper .pd-controls,
   body.paper .pd-listbox,
   body.paper .pd-griprow,
   body.paper .pd-listwrap,
-  body.paper .pd-hint,
+  body.paper .pd-keys,
   body.paper .pd-rankcol { display: none !important; }
-  body.paper .pd-detail { border: none; background: none; }
+  body.paper .pd-about { display: none; }
+  body.paper .pd-chartcard { border: none; background: none; }
+  body.paper .pd-main { display: block; }
+  body.paper .pd-left { display: none; }
 </style>
 </head>
 <body>
@@ -255,17 +315,32 @@ __BASE_CSS__
   <p class="explorer-title" id="title"></p>
 
   <div class="pd-controls">
-    <label class="metricpick">Contender
-      <select id="contender" title="The method the star marks, and the one the ranking columns report"></select>
-    </label>
-    <input class="pd-search" id="search" type="search"
-           placeholder="Filter datasets by name, domain or source" aria-label="Filter datasets">
-    <div class="pd-filtergroup" id="taskfilter"></div>
-    <div class="pd-filtergroup" id="splitfilter"></div>
-    <div class="pd-filtergroup" id="sizefilter"></div>
-    <div class="pd-filtergroup" id="balancefilter"></div>
-    <span class="hint" id="count"></span>
+    <div class="pd-steps">
+      <div class="pd-stepgroup">
+        <span class="pd-step">1</span>
+        <label class="metricpick"><span class="pd-steplabel">Pick a method</span>
+          <select id="contender" title="The contender: the method the star marks, and the one the rank and margin report"></select>
+        </label>
+      </div>
+      <div class="pd-stepgroup">
+        <span class="pd-step">2</span>
+        <span class="pd-steplabel">Pick a dataset</span>
+        <input class="pd-search" id="search" type="search"
+               placeholder="Find by name, domain or source" aria-label="Find a dataset">
+        <span class="hint" id="count"></span>
+        <span class="pd-keys" id="listhint" tabindex="0">Keys</span>
+      </div>
+    </div>
+    <div class="pd-filters">
+      <div class="pd-filtergroup" id="taskfilter"></div>
+      <div class="pd-filtergroup" id="splitfilter"></div>
+      <div class="pd-filtergroup" id="sizefilter"></div>
+      <div class="pd-filtergroup" id="balancefilter"></div>
+    </div>
   </div>
+  <!-- The chart's key, filled per dataset (buildLegend); outside the controls so paper view and the
+       figure export keep it. -->
+  <div class="legendstrip pd-legend" id="legendstrip"></div>
 
   <div class="exportbar" id="exportbar" hidden>
     <span class="hint">Export the chart</span>
@@ -274,7 +349,8 @@ __BASE_CSS__
     <button class="btn" id="btn-png" title="Download as PNG at 3x scale">PNG</button>
   </div>
 
-  <p class="pd-hint" id="listhint"></p>
+  <div class="pd-main" id="main">
+  <div class="pd-left">
   <div class="pd-listbox" id="listbox">
     <div class="pd-listwrap" id="listwrap" tabindex="0" aria-label="Datasets">
       <table class="pd-table">
@@ -292,8 +368,10 @@ __BASE_CSS__
     <button class="btn" id="btn-fit" aria-pressed="false"
             title="Size the list so it and the chart below are on screen together">&#8597; Fit table and figure to screen</button>
   </div>
+  </div>
 
   <div class="pd-detail" id="detail"></div>
+  </div>
   <div class="tooltip"></div>
 </div>
 
@@ -307,6 +385,8 @@ __BASE_JS__
 
   const DATASETS = CONFIG.datasets;
   const METHODS = CONFIG.methods;
+  // A method with a leakage warning carries the mark in every place the browser names it.
+  for (const m of METHODS) if (leakageOf(m.base)) m.name = m.base + leakageMark(m.base) + m.name.slice(m.base.length);
   // Baseline and Other share a bucket everywhere else on the site; normalize once so every
   // colour, legend and chip lookup below sees the merged family.
   for (const m of METHODS) m.family = famOf(m.family);
@@ -447,6 +527,14 @@ __BASE_JS__
   // Both directions are the same quantity — how much lower the better error is than the worse
   // one, as a fraction of the worse one — so the two halves are comparable and the sign is the
   // only thing that changes.
+  // A red mark on the datasets where the contender's leakage is proven.
+  function leakedHere(ds) {
+    const proven = leakageOf(METHODS[state.contender].base) || [];
+    if (!proven.includes(ds.name) && !proven.includes(ds.key)) return "";
+    return ` <span class="leak-tag" title="Leakage proven here: ${escapeHtml(METHODS[state.contender].base)} ` +
+      `saw this dataset during training">&#9888;&#65038;</span>`;
+  }
+
   function contenderMargin(d) {
     const c = key(d, state.contender), st = STATS[d];
     if (!c || c.e == null || st.bestErr == null) return null;
@@ -506,6 +594,18 @@ __BASE_JS__
     if (v == null || !isFinite(v)) return "—";
     return Math.round(v).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   }
+  // A count in at most four characters (950, 9.5k, 95k, 1.2M), for the narrow list.
+  function fmtCount(v) {
+    if (v == null || !isFinite(v)) return "—";
+    const scaled = (x, unit) => (x < 10 ? x.toFixed(1).replace(/\.0$/, "") : Math.round(x).toString()) + unit;
+    if (v < 1000) return Math.round(v).toString();
+    if (v < 999500) return scaled(v / 1000, "k");
+    return scaled(v / 1e6, "M");
+  }
+  // Both forms of a count; the stylesheet shows the short one in the narrow list.
+  function countHtml(v) {
+    return `<span class="pd-full">${fmtInt(v)}</span><span class="pd-short">${fmtCount(v)}</span>`;
+  }
   const TASK_SHORT = { binary: "binary", multiclass: "multi", regression: "reg" };
   function metricName(ds) { return METRIC_DISPLAY[ds.metric] || ds.metric || "error"; }
   function escapeHtml(text) {
@@ -519,7 +619,7 @@ __BASE_JS__
   }
   function methodHtml(mi) {
     const m = METHODS[mi];
-    return `<span style="color:${FAM_INK[m.family]}">${escapeHtml(m.base)}</span>` + variantBadge(m);
+    return `<span style="color:${famInk(m)}">${escapeHtml(m.base)}</span>` + variantBadge(m);
   }
 
   // ---------- marks ----------
@@ -551,6 +651,8 @@ __BASE_JS__
     const svg = document.createElementNS(NS, "svg");
     svg.setAttribute("width", STRIP_W);
     svg.setAttribute("height", STRIP_H);
+    // Drawn at STRIP_W and scaled to its cell, which is narrower beside the detail.
+    svg.setAttribute("viewBox", `0 0 ${STRIP_W} ${STRIP_H}`);
     svg.setAttribute("class", "pd-stripsvg");
     const mid = STRIP_H / 2;
     el("line", {
@@ -572,7 +674,7 @@ __BASE_JS__
     for (const p of byDataset[d]) {
       if (p.i == null || p.m === state.contender) continue;
       el("circle", {
-        cx: at(p.i), cy: mid, r: 2.7, fill: FAM_VAR[METHODS[p.m].family], opacity: 0.6,
+        cx: at(p.i), cy: mid, r: 2.7, fill: famColor(METHODS[p.m]), opacity: 0.6,
       }, svg);
     }
     const c = key(d, state.contender);
@@ -584,7 +686,7 @@ __BASE_JS__
     }
     svg.addEventListener("mousemove", ev => {
       const rect = svg.getBoundingClientRect();
-      const mx = ev.clientX - rect.left;
+      const mx = (ev.clientX - rect.left) * (STRIP_W / (rect.width || STRIP_W));
       let nearest = null, dist = Infinity;
       for (const p of byDataset[d]) {
         if (p.i == null) continue;
@@ -601,7 +703,7 @@ __BASE_JS__
     const ds = DATASETS[d];
     const verdict = tiedText(p, STATS[d]);
     return `<div class="t-name">${escapeHtml(METHODS[p.m].name)}</div>` +
-      `<div>${METHODS[p.m].family}</div>` +
+      `<div>${famLabel(METHODS[p.m])}</div>` +
       `<div>${escapeHtml(metricName(ds))} error: <b>${errWithStd(p, ds)}</b>` +
       (p.s != null ? ` <span class="t-var">(mean \u00b1 std over ${ds.splits} splits)</span>` : "") + "</div>" +
       `<div>Rank: <b>${fmtNum(p.r, 1)}</b> of ${STATS[d].n}</div>` +
@@ -615,14 +717,14 @@ __BASE_JS__
     { key: "pos", label: "#", cls: "pd-pos", sortable: false },
     { key: "name", label: "Dataset", hint: "Sort alphabetically" },
     { key: "task", label: "Task" },
-    { key: "train_rows", label: "Train rows", num: true,
+    { key: "train_rows", label: "Train rows", short: "Rows", num: true,
       hint: "Rows a model actually fits here — the largest training split, not the dataset's size" },
     { key: "features", label: "Feat.", num: true },
     { key: "rank", label: "Rank", num: true, hint: "The contender's mean rank on this dataset" },
     { key: "gap", label: "Margin", num: true,
       hint: "The contender's lead over the runner-up (+) or its deficit against the best method (\u2212)" },
     { key: "spread", label: "The field", hint: "How far the field spreads out on this dataset" },
-    { key: "tied", label: "Tied", num: true,
+    { key: "tied", label: "Tied", num: true, wide: true,
       hint: "How many methods are statistically tied with the best here (not significantly worse, " +
         "one-sided Wilcoxon signed-rank test over the splits, \u03b1 = 0.05). " +
         "The shaded band on the strip spans them; many tied methods means this dataset does not separate the field" },
@@ -652,19 +754,24 @@ __BASE_JS__
     return hay.includes(state.query);
   }
 
+  // Whether dataset `d` passes the search and the filters, with `over` standing in for some of
+  // the filters (a chip's count asks what its own value would leave).
+  function passes(d, over) {
+    const f = Object.assign({}, state, over);
+    const ds = DATASETS[d];
+    if (!matchesQuery(ds)) return false;
+    if (f.task === "classification" ? !CLASSIFICATION_TASKS.has(ds.task)
+        : (f.task !== "all" && ds.task !== f.task)) return false;
+    if (f.split !== "all" && ds.split !== f.split) return false;
+    if (f.size !== "all" && SIZE_OF[d] !== f.size) return false;
+    // "extreme" is the far end of "imbalanced", so it filters on its own flag.
+    if (f.balance === "extreme" ? !ds.extreme : (f.balance !== "all" && ds.balance !== f.balance)) return false;
+    return true;
+  }
+
   function visibleDatasets() {
     const out = [];
-    for (let d = 0; d < nD; d++) {
-      const ds = DATASETS[d];
-      if (!matchesQuery(ds)) continue;
-      if (state.task === "classification" ? !CLASSIFICATION_TASKS.has(ds.task)
-          : (state.task !== "all" && ds.task !== state.task)) continue;
-      if (state.split !== "all" && ds.split !== state.split) continue;
-      if (state.size !== "all" && SIZE_OF[d] !== state.size) continue;
-      // "extreme" is the far end of "imbalanced", so it filters on its own flag.
-      if (state.balance === "extreme" ? !ds.extreme : (state.balance !== "all" && ds.balance !== state.balance)) continue;
-      out.push(d);
-    }
+    for (let d = 0; d < nD; d++) if (passes(d, {})) out.push(d);
     const dir = state.dir;
     const compare = (a, b, sortKey, direction) => {
       const va = sortValue(a, sortKey), vb = sortValue(b, sortKey);
@@ -777,9 +884,12 @@ __BASE_JS__
     let html = "<tr>";
     for (const col of COLUMNS) {
       const sortable = col.sortable !== false;
-      const cls = (col.num ? "pd-num " : "") + (sortable ? "sortable" : "");
+      const cls = (col.num ? "pd-num " : "") + (col.wide ? "pd-wide " : "") + (sortable ? "sortable" : "");
       const title = col.hint ? ` title="${escapeHtml(col.hint)}"` : "";
-      html += `<th class="${cls}" data-k="${col.key}"${title}>${col.label}</th>`;
+      const label = col.short
+        ? `<span class="pd-full">${col.label}</span><span class="pd-short">${col.short}</span>`
+        : col.label;
+      html += `<th class="${cls}" data-k="${col.key}"${title}>${label}</th>`;
     }
     document.getElementById("thead").innerHTML = html + "</tr>";
     for (const th of document.querySelectorAll("#thead th.sortable")) {
@@ -815,19 +925,27 @@ __BASE_JS__
       tr.dataset.d = String(d);
       if (d === state.selected) tr.className = "sel";
       const meta = [ds.domain, ds.source, ds.year].filter(Boolean).join(" · ");
+      // The row's facts on hover, with what the narrow list (beside the detail) leaves out or clips.
+      tr.title = [
+        ds.name,
+        `${fmtInt(trainRows(ds))} train rows · ${fmtInt(ds.features)} features`,
+        st.tiedKnown ? `${st.tied} of ${st.n} tied with the best` : "",
+        st.best ? `winner: ${METHODS[st.best.m].name}` : "",
+        meta,
+      ].filter(Boolean).join("\n");
       tr.innerHTML =
         `<td class="pd-pos">${i + 1}</td>` +
-        `<td><span class="pd-name" title="${escapeHtml(meta || ds.key)}">${escapeHtml(ds.name)}</span></td>` +
+        `<td class="pd-namecell"><span class="pd-name">${escapeHtml(ds.name)}</span>${leakedHere(ds)}</td>` +
         `<td><span class="pd-tag">${escapeHtml(TASK_SHORT[ds.task] || ds.task || "?")}</span></td>` +
-        `<td class="pd-num">${fmtInt(trainRows(ds))}</td>` +
-        `<td class="pd-num">${fmtInt(ds.features)}</td>` +
+        `<td class="pd-num">${countHtml(trainRows(ds))}</td>` +
+        `<td class="pd-num">${countHtml(ds.features)}</td>` +
         `<td class="pd-num">${c ? fmtNum(c.r, 1) : "—"}` +
-        `<span class="pd-pos"> / ${st.n}</span></td>` +
+        `<span class="pd-pos pd-full"> / ${st.n}</span></td>` +
         `<td class="pd-num pd-margin${margin > 0.05 ? " is-ahead" : ""}${c && c.b === 1 && st.tiedKnown && st.best !== c ? " is-tied" : ""}">` +
         `${fmtMargin(margin)}${tieMark(c, st)}</td>` +
         `<td class="pd-stripcell"></td>` +
-        `<td class="pd-num pd-tiedcell">${st.tiedKnown ? `<b>${st.tied}</b> / ${st.n}` : "—"}</td>` +
-        `<td>${st.best ? methodHtml(st.best.m) : "—"}</td>`;
+        `<td class="pd-num pd-tiedcell pd-wide">${st.tiedKnown ? `<b>${st.tied}</b> / ${st.n}` : "—"}</td>` +
+        `<td class="pd-winner">${st.best ? methodHtml(st.best.m) : "—"}</td>`;
       tr.querySelector(".pd-stripcell").appendChild(buildStrip(d));
       tr.addEventListener("click", () => select(d));
       frag.appendChild(tr);
@@ -837,6 +955,7 @@ __BASE_JS__
     const total = nD, shown = visible.length;
     document.getElementById("count").textContent =
       shown === total ? `${total} datasets` : `${shown} of ${total} datasets`;
+    syncFilterCounts();
     sizeList();
     if (visible.length && !visible.includes(state.selected)) select(visible[0], { scroll: false });
     else postHeight();
@@ -871,32 +990,45 @@ __BASE_JS__
     const d = state.selected;
     if (d < 0 || d >= nD) { detailEl.innerHTML = ""; return; }
     const ds = DATASETS[d];
-    const items = [
-      ["Task", TASK_SHORT[ds.task] || ds.task],
-      ds.split ? ["Split", SPLIT_LABELS[ds.split] || ds.split] : null,
-      ["Metric", metricName(ds)],
-      ["Train rows", fmtInt(trainRows(ds))],
-      ["Dataset rows", fmtInt(ds.rows)],
-      ["Features", fmtInt(ds.features)],
-      ds.classes != null && ds.classes > 0 ? ["Classes", fmtInt(ds.classes)] : null,
-      ds.imbalance_ratio != null ? ["Largest : smallest class", `${fmtNum(ds.imbalance_ratio, 1)} : 1` +
-        (ds.extreme ? " (extreme imbalance)" : ds.balance ? ` (${ds.balance})` : "")] : null,
-      ds.target_skew != null ? ["Target skewness", fmtNum(ds.target_skew, 2) + (ds.balance ? ` (${ds.balance})` : "")] : null,
-      ["Splits", fmtInt(ds.splits)],
-      ["Methods that ran", fmtInt(STATS[d].n)],
-      STATS[d].tiedKnown ? ["Tied with the best", `${STATS[d].tied} of ${STATS[d].n}`] : null,
-      // Imputed results are left out of this page, so the size of the field varies by dataset;
-      // naming the missing ones is what makes that legible rather than puzzling.
-      ds.skipped ? ["Could not run here", fmtInt(ds.skipped)] : null,
-      ds.domain ? ["Domain", ds.domain] : null,
-      ds.source ? ["Source", ds.source] : null,
-      ds.year ? ["Year", String(ds.year)] : null,
-    ].filter(Boolean);
-    const facts = items
-      .map(([k, v]) => `<span class="item">${k}: <b>${escapeHtml(v)}</b></span>`)
-      .join("");
+    const balance = ds.extreme ? "extreme" : ds.balance || "";
+    const n = STATS[d].n;
+    // What the dataset is, as three columns of two lines each, whatever the task: how it is scored,
+    // what it holds, and how the field did. A value's hover carries what its line leaves out.
+    // A multiclass task names its classes (a binary one has two); the target line is the class
+    // ratio for classification and the skewness for regression.
+    const classes = ds.task === "multiclass" && ds.classes > 0 ? ` (${fmtInt(ds.classes)})` : "";
+    const target = ds.imbalance_ratio != null
+      ? ["Class ratio", [`${fmtNum(ds.imbalance_ratio, 1)} : 1`, balance]]
+      : ["Target skew", [ds.target_skew != null ? fmtNum(ds.target_skew, 2) : "", balance]];
+    const groups = [
+      ["Evaluation", [
+        ["Task", `${TASK_LABELS[ds.task] || ds.task}${classes} · ${metricName(ds)}`],
+        ["Splits", [fmtInt(ds.splits), ds.split ? SPLIT_LABELS[ds.split] || ds.split : ""].filter(Boolean).join(" · ")],
+      ]],
+      ["Data", [
+        ["Shape", `${fmtInt(trainRows(ds))} × ${fmtInt(ds.features)}`,
+          `${fmtInt(trainRows(ds))} training rows (of ${fmtInt(ds.rows)} in all) and ${fmtInt(ds.features)} features`],
+        [target[0], target[1].filter(Boolean).join(" · ") || "—"],
+      ]],
+      ["Field", [
+        // Imputed results are left out of this page, so the size of the field varies by dataset;
+        // naming the missing ones is what makes that legible rather than puzzling.
+        ["Ran", ds.skipped ? `${fmtInt(n)} of ${fmtInt(n + ds.skipped)} methods` : `${fmtInt(n)} methods`,
+          ds.skipped ? `${fmtInt(ds.skipped)} methods could not run on every split of this dataset` : ""],
+        ["Tied with the best", STATS[d].tiedKnown ? `${STATS[d].tied} of ${n}` : "—"],
+      ]],
+    ];
+    const facts = groups.map(([label, rows]) =>
+      `<div class="pd-factgroup"><span class="pd-factlabel">${label}</span><dl>` +
+      rows.map(([k, v, hint]) =>
+        `<div class="pd-factrow"><dt>${k}</dt><dd title="${escapeHtml(hint || v)}">${escapeHtml(v)}</dd></div>`).join("") +
+      "</dl></div>").join("");
+    const origin = [ds.domain, ds.source, ds.year].filter(Boolean).map(String).join(" · ");
     detailEl.innerHTML =
-      '<div class="pd-dbody">' +
+      `<div class="pd-about"><div class="pd-abouthead"><span class="pd-aboutname">${escapeHtml(ds.name)}</span>` +
+      (origin ? `<span class="pd-aboutsub">${escapeHtml(origin)}</span>` : "") + "</div>" +
+      `<div class="pd-facts">${facts}</div></div>` +
+      '<div class="pd-chartcard"><div class="pd-dbody">' +
       '<div class="pd-chartcol">' +
       '<div class="pd-chartbar">' +
       '<label class="metricpick">Y-axis <select id="pd-yaxis"></select></label>' +
@@ -904,12 +1036,9 @@ __BASE_JS__
       '<button class="btn" id="pd-front">Front + contender</button>' +
       '<button class="btn" id="pd-all">All</button>' +
       "</div>" +
-      '<span class="hint">Click a line, a point or a method on the right to hold it in colour</span>' +
+      '<span class="hint">Click a line, a point or a method in the ranking to hold it in colour</span>' +
       "</div>" +
-      '<div class="legendstrip" id="legendstrip"></div>' +
       '<div class="chartbox" id="pd-chartbox"><svg id="pd-chart" role="img" aria-label="Tuning trajectories"></svg></div>' +
-      `<div class="pd-about"><div class="pd-aboutname">${escapeHtml(ds.name)}</div>` +
-      `<div class="pd-aboutfacts">${facts}</div></div>` +
       "</div>" +
       '<div class="pd-rankcol">' +
       `<div class="grouplabel">Every method on ${escapeHtml(ds.name)}</div>` +
@@ -919,7 +1048,7 @@ __BASE_JS__
         : `<div class="pd-signote">too few splits for a significance test (fewer than ${SIG.minSplits || 5}); ` +
           `mean \u00b1 std of the error where there is more than one</div>`) +
       '<ol class="pd-ranklist" id="pd-rank"></ol>' +
-      "</div></div>";
+      "</div></div></div>";
 
     const ySelect = document.getElementById("pd-yaxis");
     for (const m of Y_METRICS) {
@@ -954,7 +1083,7 @@ __BASE_JS__
       const hasTraj = trajIndexOf(p.m) >= 0;
       li.className = "pd-rankrow" + (p.m === state.contender ? " is-contender" : "") +
         (p.b === 1 && STATS[d].tiedKnown ? " is-tied" : "") + (hasTraj ? "" : " no-traj");
-      li.style.setProperty("--fam", FAM_VAR[m.family]);
+      li.style.setProperty("--fam", famColor(m));
       const verdict = tiedText(p, STATS[d]);
       li.title = `${m.name} — ${errWithStd(p, DATASETS[d])} ${metricName(DATASETS[d])}, ${fmtNum(p.i, 1)}% behind the best` +
         (p.t != null ? `, ${fmtTime(p.t)} to fit` : "") + (verdict ? `. ${verdict}` : "") +
@@ -1015,19 +1144,19 @@ __BASE_JS__
       '<span class="item"><svg width="26" height="9" viewBox="0 0 26 9">' +
       '<line x1="0" y1="4.5" x2="26" y2="4.5" stroke="var(--muted)" stroke-width="2"/>' +
       '<circle cx="6" cy="4.5" r="2.6" fill="var(--muted)"/><circle cx="17" cy="4.5" r="2.6" fill="var(--muted)"/>' +
-      "</svg> Tuning trajectory (more configs &rarr; more time)</span>" +
+      "</svg> Tuning trajectory</span>" +
       '<span class="item"><svg width="14" height="14" viewBox="0 0 14 14">' +
       `<path d="${starPath(7, 7, 6)}" fill="var(--contender)"/></svg> Contender</span>` +
       '<span class="item"><svg width="26" height="9" viewBox="0 0 26 9">' +
       '<line x1="0" y1="4.5" x2="26" y2="4.5" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="6 4"/>' +
-      "</svg> Pareto front on this dataset</span>";
-    const families = FAM_ORDER.filter(f => byDataset[d].some(p => METHODS[p.m].family === f));
-    if (families.length > 1) {
-      html += '<span class="legendbreak"></span><span class="item">Family:</span>';
-      for (const fam of families) {
+      "</svg> Pareto front</span>";
+    const swatches = legendSwatches(byDataset[d].map(p => METHODS[p.m]));
+    if (swatches.length > 1) {
+      html += '<span class="pd-legsep"></span>';
+      for (const sw of swatches) {
         html += `<span class="item"><svg width="12" height="12" viewBox="0 0 12 12">` +
-          `<circle cx="6" cy="6" r="5" fill="${FAM_VAR[fam]}"/></svg> ` +
-          `<span style="color:${FAM_INK[fam]}">${fam}</span></span>`;
+          `<circle cx="6" cy="6" r="5" fill="${sw.color}"/></svg> ` +
+          `<span style="color:${sw.ink}">${sw.label}</span></span>`;
       }
     }
     box.innerHTML = html;
@@ -1150,8 +1279,7 @@ __BASE_JS__
       const pts = arr.filter(p => p[metric.key] != null);
       if (!pts.length) continue;
       const on = active.has(t);
-      const fam = famOfTrajectory(t);
-      const color = on ? FAM_VAR[fam] : "var(--pt-muted)";
+      const color = on ? famColor(trajectoryKind(t)) : "var(--pt-muted)";
       if (pts.length > 1) {
         el("path", {
           d: pts.map((p, i) => `${i ? "L" : "M"}${X(p.x)},${Y(p[metric.key])}`).join(" "),
@@ -1194,7 +1322,7 @@ __BASE_JS__
       const px = X(bestPt.x);
       const toRight = px + 10 + w <= W - M.r;
       labels.push({
-        name: name, family: famOfTrajectory(t), w: w,
+        name: name, ...trajectoryKind(t), w: w,
         anchor: toRight ? "start" : "end",
         x: toRight ? px + 10 : Math.max(M.l + w + 2, px - 10),
         y: Y(bestPt[metric.key]) - 11,
@@ -1213,9 +1341,9 @@ __BASE_JS__
     const labelG = el("g", {}, svg);
     for (const l of labels) {
       el("text", {
-        x: l.x, y: Math.max(l.y, M.t + 11), "font-size": 12.5, "font-weight": 700, fill: FAM_VAR[l.family],
+        x: l.x, y: Math.max(l.y, M.t + 11), "font-size": 12.5, "font-weight": 700, fill: famColor(l),
         "paint-order": "stroke", stroke: "var(--card)", "stroke-width": 3.5, "text-anchor": l.anchor,
-      }, labelG).textContent = l.name;
+      }, labelG).textContent = l.name + leakageMark(l.name);
     }
 
     const hits = el("g", {}, svg);
@@ -1247,23 +1375,23 @@ __BASE_JS__
     legend.insertAdjacentHTML("beforeend",
       '<span class="item pd-offscale"><svg width="14" height="14" viewBox="0 0 14 14">' +
       '<path d="M7,3 L12,10 L2,10 Z" fill="none" stroke="var(--muted)" stroke-width="1.4"/></svg>' +
-      " Off the top of the scale (hover for the value)</span>");
+      " Off the scale (hover for the value)</span>");
   }
 
-  // A trajectory line's family: taken from a leaderboard method that shares its base name, so
-  // the line, the ranking list and the strip agree on the colour.
-  const famCache = new Map();
-  function famOfTrajectory(t) {
+  // A trajectory line's family and system shade: taken from a leaderboard method that shares its
+  // base name, so the line, the ranking list and the strip agree on the colour.
+  const kindCache = new Map();
+  function trajectoryKind(t) {
     const name = TRAJ_METHODS[t];
-    if (famCache.has(name)) return famCache.get(name);
+    if (kindCache.has(name)) return kindCache.get(name);
     const match = METHODS.find(m => m.base === name);
-    const fam = match ? match.family : FAM_MERGED;
-    famCache.set(name, fam);
-    return fam;
+    const kind = { family: match ? match.family : FAM_MERGED, shade: match ? match.shade : undefined };
+    kindCache.set(name, kind);
+    return kind;
   }
 
   function chartTip(d, t, p) {
-    return `<div class="t-name">${escapeHtml(TRAJ_METHODS[t])}` +
+    return `<div class="t-name">${escapeHtml(TRAJ_METHODS[t] + leakageMark(TRAJ_METHODS[t]))}` +
       (p.n != null ? ` <span class="t-var">(${p.n} config${p.n === 1 ? "" : "s"})</span>` : "") + "</div>" +
       `<div>Test error: <b>${fmtErr(p.e)}</b></div>` +
       `<div>Improvability: <b>${fmtNum(p.i, 1)}%</b></div>` +
@@ -1317,9 +1445,11 @@ __BASE_JS__
       const button = document.createElement("button");
       button.className = "pd-fchip";
       button.type = "button";
-      button.textContent = opt.label;
+      button.innerHTML = escapeHtml(opt.label) + '<span class="n"></span>';
       button.dataset.v = opt.key;
+      button.dataset.f = field;
       button.addEventListener("click", () => {
+        if (button.getAttribute("aria-disabled") === "true") return;
         state[field] = opt.key;
         syncFilter(box, field);
         renderList();
@@ -1331,6 +1461,19 @@ __BASE_JS__
   function syncFilter(box, field) {
     for (const button of box.querySelectorAll(".pd-fchip")) {
       button.setAttribute("aria-pressed", String(button.dataset.v === state[field]));
+    }
+  }
+  // Each chip counts the datasets it would leave, given the search and the other filters; one
+  // that would leave none is shown but cannot be picked.
+  function syncFilterCounts() {
+    for (const button of document.querySelectorAll(".pd-fchip")) {
+      const field = button.dataset.f;
+      let n = 0;
+      for (let d = 0; d < nD; d++) if (passes(d, { [field]: button.dataset.v })) n++;
+      button.querySelector(".n").textContent = n;
+      const empty = n === 0 && button.dataset.v !== state[field];
+      if (empty) button.setAttribute("aria-disabled", "true");
+      else button.removeAttribute("aria-disabled");
     }
   }
 
@@ -1434,11 +1577,9 @@ __BASE_JS__
   // The click is spelled out as a precondition, not just as an alternative way to select. This
   // page is a sandboxed frame inside the site, so it receives no key events at all until the
   // reader has clicked inside it — without that sentence the arrow keys look broken.
-  document.getElementById("listhint").innerHTML =
-    "Click a dataset to see how the field got there · after that first click, " +
-    "<kbd>&larr;</kbd> <kbd>&rarr;</kbd> step through the list and " +
-    "<kbd>Home</kbd> <kbd>End</kbd> jump to the ends · sort by clicking a column · " +
-    "the list scrolls, and the bar below it resizes it";
+  document.getElementById("listhint").title =
+    "Click a dataset to see how the field got there. After that first click, ← → step through " +
+    "the list and Home / End jump to its ends. Sort by clicking a column.";
 
   document.addEventListener("keydown", ev => {
     const tag = (ev.target && ev.target.tagName) || "";

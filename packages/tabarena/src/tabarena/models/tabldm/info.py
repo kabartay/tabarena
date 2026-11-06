@@ -25,6 +25,7 @@ tabldm_method_metadata = MethodMetadata.config(
     cache_type="r2",
     cache_kwargs={"bucket": "tabarena", "prefix": "cache"},
     reference_url="https://huggingface.co/occams/Xiaomi-TabLDM",
+    organization="Xiaomi",
     license="Apache-2.0",
 )
 
@@ -49,6 +50,7 @@ tabldm_new_method_metadata = MethodMetadata.config(
     cache_type="r2",
     cache_kwargs={"bucket": "tabarena", "prefix": "cache"},
     reference_url="https://huggingface.co/occams/Xiaomi-TabLDM",
+    organization="Xiaomi",
     license="Apache-2.0",
 )
 
@@ -60,7 +62,7 @@ tabldm_info = ModelInfo(
     # TabLDM is not published on PyPI; pinned to a commit so the benchmarked code is fixed.
     # Keep in sync with the `tabldm` extra in pyproject.toml.
     pip_extra=(
-        "Xiaomi-TabLDM @ git+https://github.com/xiaomi-research/xiaomi-tabldm.git@6773a30d43e43fad3e8b474e20ca8c7ec40dcd76",
+        "Xiaomi-TabLDM @ git+https://github.com/xiaomi-research/xiaomi-tabldm.git@19e752a7f09ec7e3d4bf2e04e6a45c4170f8e518",
     ),
     prefetch_weights=TabLDMModel.prefetch_weights,
 )

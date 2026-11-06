@@ -168,7 +168,7 @@ __BASE_JS__
       if (excluded && excluded.has(p.method)) continue;
       let entry = byMethod.get(p.method);
       if (!entry) {
-        entry = { method: p.method, family: p.family, url: p.url, points: [] };
+        entry = { method: p.method, family: p.family, shade: p.shade, url: p.url, points: [] };
         byMethod.set(p.method, entry);
       }
       entry.points.push(p);
@@ -189,6 +189,13 @@ __BASE_JS__
     methods: new Set(byMethod.keys()),
     variants: new Set(VARIANT_ORDER),
   };
+  // Methods the host asks every chart to follow (`onFollowMessage`), shown whatever the chips
+  // select; `hovered` is the method under the pointer in another chart of the page
+  // (`onHoverMessage`), and `layout` the last render's columns, to mark it without a redraw.
+  let followed = new Set();
+  let hovered = null;
+  let layout = null;
+  let hoverBand = null;
 
   function metric() { return metricByKey[state.metric]; }
 
@@ -225,7 +232,8 @@ __BASE_JS__
 
   function visibleEntries() {
     const m = metric();
-    return sortedMethods([...byMethod.values()].filter(e => state.methods.has(e.method) && bestOf(e, m) != null), m);
+    const shown = e => (state.methods.has(e.method) || followed.has(e.method)) && bestOf(e, m) != null;
+    return sortedMethods([...byMethod.values()].filter(shown), m);
   }
   // Rendered width of each label, measured in the live document (font metrics
   // are not knowable up front): it decides whether the names fit on one row or
@@ -260,6 +268,8 @@ __BASE_JS__
     axisSvg.textContent = "";
     axisSvg.setAttribute("width", AXIS_W);
 
+    layout = null;
+    hoverBand = null;
     if (!scroller.clientWidth) return;   // see the note in the Pareto template
     const avail = Math.max(240, scroller.clientWidth - 2);
     if (!entries.length) {
@@ -278,7 +288,7 @@ __BASE_JS__
     const plotW = Math.max(avail, slot * entries.length);
     // Names go on one row when they fit side by side, otherwise on two
     // staggered rows (each label then has two slots of room).
-    const labels = entries.map(e => e.method + (e.imputed ? " ‡" : ""));
+    const labels = entries.map(e => e.method + leakageMark(e.method) + (e.imputed ? " ‡" : ""));
     const labelWidths = measureLabels(labels);
     const widest = Math.max(...labelWidths);
     const labelRows = widest <= slot - 6 ? 1 : 2;
@@ -355,6 +365,14 @@ __BASE_JS__
     const band = el("rect", {
       x: 0, y: TOP, width: slot, height: PLOT_H + 6, fill: "var(--ink)", opacity: 0, "pointer-events": "none",
     }, svg);
+    // A followed method's column carries an accent band, on every chart of the page at once.
+    entries.forEach((entry, i) => {
+      if (!followed.has(entry.method)) return;
+      el("rect", {
+        x: i * slot, y: TOP, width: slot, height: PLOT_H + 6, fill: "var(--accent)", opacity: 0.16,
+        "pointer-events": "none",
+      }, svg);
+    });
 
     const defs = el("defs", {}, svg);
     // -- imputed hatch, reused by every partially imputed bar. Crossed diagonals,
@@ -440,7 +458,8 @@ __BASE_JS__
       }
       const t = el("text", {
         x: cx, y, "font-size": LABEL_SIZE, "text-anchor": "middle", "font-weight": 650,
-        fill: FAM_INK[entry.family] || "var(--ink)",
+        fill: famInk(entry) || "var(--ink)",
+        "text-decoration": followed.has(entry.method) ? "underline" : "none",
         // A halo in the surface color keeps the glyphs legible where a nudged
         // name crosses a hairline, rather than the line running through them.
         "paint-order": "stroke", stroke: "var(--paper)", "stroke-width": 3,
@@ -468,18 +487,41 @@ __BASE_JS__
         band.setAttribute("x", i * slot);
         band.setAttribute("opacity", 0.06);
         showTip(entry, ev);
+        postHover(entry.method);
       });
       h.addEventListener("mousemove", ev => tip.move(ev));
-      h.addEventListener("mouseleave", () => { band.setAttribute("opacity", 0); tip.hide(); });
-      h.addEventListener("click", () => toggleMethod(entry.method));
+      h.addEventListener("mouseleave", () => { band.setAttribute("opacity", 0); tip.hide(); postHover(null); });
+      h.addEventListener("click", () => pickMethod(entry.method, () => toggleMethod(entry.method)));
     });
 
+    layout = { slot, column: new Map(entries.map((e, i) => [e.method, i])), height: PLOT_H + 6 };
+    markHovered();
     postHeight();
   }
 
+  // Outline the column of the method under the pointer in another chart of the page.
+  function markHovered() {
+    if (hoverBand) hoverBand.remove();
+    hoverBand = null;
+    const i = hovered && layout ? layout.column.get(hovered) : undefined;
+    if (i === undefined) return;
+    hoverBand = el("rect", {
+      x: i * layout.slot + 1, y: TOP, width: layout.slot - 2, height: layout.height, fill: "none",
+      stroke: "var(--ink)", "stroke-width": 1.6, "stroke-dasharray": "4 3", rx: 3, "pointer-events": "none",
+    }, svg);
+  }
+  onHoverMessage(method => {
+    hovered = method;
+    markHovered();
+  });
+  onFollowMessage(names => {
+    followed = names;
+    render();
+  });
+
   function showTip(entry, ev) {
     const m = metric();
-    let html = `<div class="t-name">${entry.method}</div><div>${entry.family}</div>`;
+    let html = `<div class="t-name">${entry.method}${leakageMark(entry.method)}</div><div>${famLabel(entry)}</div>`;
     for (const p of entry.points) {
       if (!shownVariant(p) || p[m.key] == null) continue;
       const ci = m.ci && p[m.ci.lo] != null
@@ -489,7 +531,7 @@ __BASE_JS__
       html += `<div><span class="t-var">${vlabel}:</span> <b>${fmtMetric(m, p[m.key])}</b>${ci}</div>`;
     }
     if (entry.imputed) html += `<div class="t-imp">Imputed on ${fmtNum(entry.imputed_pct, 0)}% of datasets</div>`;
-    tip.show(html, ev);
+    tip.show(html + PICK_HINT, ev);
   }
 
   // ---------- chips ----------
@@ -528,7 +570,7 @@ __BASE_JS__
         const entry = byMethod.get(name);
         const b = document.createElement("button");
         b.className = "chip";
-        b.style.setProperty("--fam", FAM_VAR[fam]);
+        b.style.setProperty("--fam", entry ? famColor(entry) : FAM_VAR[fam]);
         b.appendChild(Object.assign(document.createElement("span"), { className: "dot" }));
         b.appendChild(Object.assign(document.createElement("span"), { textContent: name }));
         if (entry && entry.imputed) {
@@ -727,13 +769,13 @@ __BASE_JS__
     // their names under the axis are set in the System family colour like every other method's,
     // and leaving them out left that colour unexplained. It is the bar that is drawn in the
     // separate --var-system, not the name.
-    const families = FAM_ORDER.filter(f => POINTS.some(p => p.family === f));
-    if (families.length > 1) {
+    const swatches = legendSwatches(POINTS);
+    if (swatches.length > 1) {
       parts.push('<span class="legendbreak"></span><span class="item">Family:</span>');
-      for (const fam of families) {
+      for (const sw of swatches) {
         parts.push(`<span class="item"><svg width="16" height="9" viewBox="0 0 16 9">` +
-          `<rect x="0" y="1" width="16" height="7" rx="2" fill="${FAM_VAR[fam]}"/></svg> ` +
-          `<span style="color:${FAM_INK[fam]}">${fam}</span></span>`);
+          `<rect x="0" y="1" width="16" height="7" rx="2" fill="${sw.color}"/></svg> ` +
+          `<span style="color:${sw.ink}">${sw.label}</span></span>`);
       }
     }
     document.getElementById("legendstrip").innerHTML = parts.join("");

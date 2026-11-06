@@ -11,9 +11,15 @@ explorers (see :mod:`tabarena.plot.interactive._explorer_shared`).
 The rendered page has zero external dependencies (no plotting library, fonts,
 or CDN assets), renders in light and dark mode via ``prefers-color-scheme``,
 and offers: per-method highlight chips grouped by model family, family-level
-toggle buttons, a metric selector (e.g. Improvability vs Elo) that re-anchors
-the Pareto front, hover tooltips with exact values, dashed-ring marking of
-partially imputed methods, and a collapsible data table.
+toggle buttons, a metric selector (e.g. Improvability vs Elo) and a time-axis
+selector (e.g. train, inference or total time; per 1K samples or per task;
+median or mean) that re-anchor the Pareto front, a subset selector when the
+page holds several task subsets (each point names its ``subset``), hover
+tooltips with exact values, dashed-ring marking of partially imputed methods,
+typed axis limits kept per view (subset, metric and time axis), unselected
+methods greyed out or hidden, a typed chart size, an editable figure title drawn above the chart (by default the page's title
+and subset), methods renamed from their chips, a collapsible data table, and a
+"Save view" button that downloads the page opening on the current view.
 """
 
 from __future__ import annotations
@@ -26,6 +32,9 @@ EXPLORER_TEMPLATE = r"""<!doctype html>
 <title>__PAGE_TITLE__</title>
 <style>
 __BASE_CSS__
+  /* the selectors' labels stay on one line beside long option texts */
+  .metricpick { white-space: nowrap; }
+  .metricpick select { max-width: 100%; }
 
   /* Two-column layout: controls + chips in a side panel, chart beside it.
      ``chips-right`` mirrors the columns. Wraps to stacked when narrow. */
@@ -39,6 +48,8 @@ __BASE_CSS__
   }
 
   .legendstrip .legendbreak { flex-basis: 100%; height: 0; }
+  /* A typed chart width caps the legend's width, padding included, so the exports match the chart. */
+  .mainbox .legendstrip { box-sizing: border-box; }
   .chartbox { position: relative; }
   /* The chart is sized in device pixels by render() rather than scaled from a
      viewBox: scaling stretched the type along with the plot, and a viewBox tall
@@ -50,25 +61,103 @@ __BASE_CSS__
   .sidebox .chips::-webkit-scrollbar-thumb {
     background: var(--pt-muted); border-radius: 8px; border: 3px solid transparent; background-clip: content-box;
   }
+
+  /* Typed axis limits: one row per axis, min and max side by side. An empty box shows the
+     automatic limit as its placeholder; a value the axis cannot use is outlined dashed. */
+  .limits {
+    display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(0, 1fr); align-items: center;
+    gap: 5px 7px; width: 100%; font-size: 12.5px; font-weight: 600; color: var(--muted);
+  }
+  .limits .limits-head { font-size: 11.5px; font-weight: 600; }
+  .limits input {
+    width: 100%; box-sizing: border-box; min-width: 0;
+    font: 600 12.5px/1.2 system-ui, sans-serif; color: var(--ink);
+    background: var(--chip-bg); border: 1px solid var(--line); border-radius: 7px; padding: 5px 7px;
+  }
+  .limits input::placeholder { color: var(--muted); font-weight: 500; }
+  .limits input[aria-invalid="true"] { border: 1.5px dashed var(--muted); }
+  .limits input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .limits .btnrow { grid-column: 1 / -1; }
+
+  /* The figure title box spans the panel. */
+  .titlepick { width: 100%; }
+  .titlepick input {
+    flex: 1 1 auto; min-width: 0; box-sizing: border-box;
+    font: 600 12.5px/1.2 system-ui, sans-serif; color: var(--ink);
+    background: var(--chip-bg); border: 1px solid var(--line); border-radius: 7px; padding: 5px 7px;
+  }
+  .titlepick input::placeholder { color: var(--muted); font-weight: 500; }
+  .titlepick input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* A method chip's rename button sits on the chip's corner while the chip is hovered or focused,
+     so the chips keep their layout; the rename box takes the chip's place while it is open. */
+  .chipwrap { position: relative; display: inline-flex; }
+  .chip-edit {
+    position: absolute; top: -7px; right: -6px; width: 18px; height: 18px; padding: 0;
+    display: none; align-items: center; justify-content: center;
+    font: 600 11px/1 system-ui, sans-serif; color: var(--ink); cursor: pointer;
+    background: var(--card); border: 1px solid var(--line); border-radius: 50%;
+  }
+  .chipwrap:hover .chip-edit, .chipwrap:focus-within .chip-edit { display: inline-flex; }
+  .chip-edit:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .chip-rename {
+    font: 500 12.5px/1 system-ui, sans-serif; color: var(--ink); background: var(--card);
+    border: 1px solid var(--accent); border-radius: 999px; padding: 4px 9px; min-width: 9ch; max-width: 100%;
+  }
+  .chip-rename:focus-visible { outline: none; }
 </style>
 </head>
 <body>
   <div class="viewbar">
     <button class="btn" id="btn-paper" title="White background, chart and legend only — for slides and papers">Paper view</button>
+    <button class="btn" id="btn-save-view"
+      title="Download this page opening on the current view (subset, axes, selection, title, limits, size and names); it stays editable">Save view</button>
   </div>
-  <p class="explorer-title" id="title"></p>
   <div class="explorer-grid" id="grid">
     <div class="sidebox">
       <div class="controls">
+        <label class="metricpick titlepick">Title
+          <input id="fig-title" type="text" spellcheck="false" placeholder="No title" aria-label="Figure title">
+        </label>
+        <label class="metricpick" id="subsetpick" hidden>Subset
+          <select id="subset-select"></select>
+        </label>
         <label class="metricpick" id="metricpick" hidden>Y-axis
           <select id="metric-select"></select>
+        </label>
+        <label class="metricpick" id="xaxispick" hidden>X-axis
+          <select id="xaxis-select"></select>
         </label>
         <div class="btnrow">
           <button class="btn" id="btn-front">Pareto front</button>
           <button class="btn" id="btn-all">All</button>
           <button class="btn" id="btn-none">Clear</button>
+          <button class="btn toggle" id="btn-hide-off"
+            title="Hide the unselected methods instead of greying them out; the dashed front then joins the shown points">Hide unselected</button>
+          <button class="btn" id="btn-reset-names" hidden title="Back to the methods' own names">Reset names</button>
         </div>
-        <span class="hint">Click methods or family buttons to highlight &middot; hover points for details</span>
+        <div class="limits" id="limits" role="group" aria-label="Axis limits for this view">
+          <span>Axis limits</span><span class="limits-head">min</span><span class="limits-head">max</span>
+          <span>X</span>
+          <input id="lim-xmin" type="number" step="any" min="0" aria-label="X-axis minimum">
+          <input id="lim-xmax" type="number" step="any" min="0" aria-label="X-axis maximum">
+          <span>Y</span>
+          <input id="lim-ymin" type="number" step="any" aria-label="Y-axis minimum">
+          <input id="lim-ymax" type="number" step="any" aria-label="Y-axis maximum">
+          <div class="btnrow">
+            <button class="btn" id="btn-auto-limits" title="Back to the automatic limits for this view">Auto limits</button>
+          </div>
+        </div>
+        <div class="limits" id="chart-size" role="group" aria-label="Chart size in pixels">
+          <span>Chart size</span><span class="limits-head">width</span><span class="limits-head">height</span>
+          <span>px</span>
+          <input id="size-w" type="number" step="10" min="240" aria-label="Chart width in pixels">
+          <input id="size-h" type="number" step="10" min="200" aria-label="Chart height in pixels">
+          <div class="btnrow">
+            <button class="btn" id="btn-auto-size" title="Back to the panel's width and the default height">Auto size</button>
+          </div>
+        </div>
+        <span class="hint">Click methods or family buttons to highlight &middot; &#9998; on a method renames it &middot; hover points for details</span>
       </div>
       <div class="chips" id="chips"></div>
     </div>
@@ -92,29 +181,49 @@ __BASE_CSS__
     <div class="tblwrap" id="tblwrap"></div>
   </details>
 
+<script type="application/json" id="saved-view">null</script>
 <script>
 (function () {
   "use strict";
   const CONFIG = __CONFIG_JSON__;
   const POINTS = __POINTS_JSON__;
+  // The page as it loaded, before any script changed it: "Save view" writes a view into a copy of it.
+  const PRISTINE = document.documentElement.cloneNode(true);
 
 __BASE_JS__
 
   const TRAJECTORY = CONFIG.mode === "trajectory";
 
-  const titleEl = document.getElementById("title");
-  if (CONFIG.title) titleEl.textContent = CONFIG.title; else titleEl.hidden = true;
+  // Task subsets the page holds (each point names its `subset`); one is shown at a time, the first at load.
+  const SUBSETS = CONFIG.subsets || null;
+  let subsetKey = SUBSETS ? SUBSETS[0].key : null;
+
+  // The figure title, drawn at the top of the chart so that paper view and the exports carry it. Each
+  // subset opens on its own default (the page's title and the subset's label); a title typed for a
+  // subset stays with it, and an emptied box draws no title.
+  const titleInput = document.getElementById("fig-title");
+  const titleBySubset = new Map();
+  function defaultTitle() {
+    const subset = SUBSETS ? SUBSETS.find(s => s.key === subsetKey).label : null;
+    return [CONFIG.title, subset].filter(Boolean).join(" · ");
+  }
+  function figTitle() { return titleBySubset.has(subsetKey) ? titleBySubset.get(subsetKey) : defaultTitle(); }
+  function showTitle() { titleInput.value = figTitle(); }
+  showTitle();
 
   // Column order: chips/controls left of the chart, or mirrored.
   document.getElementById("grid").classList.add(CONFIG.chipsSide === "right" ? "chips-right" : "chips-left");
 
   const svg = document.getElementById("chart");
   const box = document.getElementById("chartbox");
+  const legendStrip = document.getElementById("legendstrip");
   const chipsBox = document.getElementById("chips");
   const controlsBox = document.querySelector(".controls");
   const tip = makeTooltip(box);
   // Matches the point labels drawn in `render` — see the side/overlap logic there.
   const textWidth = makeTextMeasurer(svg, { size: 13, weight: 700 });
+  const axisTitleWidth = makeTextMeasurer(svg, { size: 14, weight: 650 });
+  const figTitleWidth = makeTextMeasurer(svg, { size: 16, weight: 700 });
 
   // Marker glyph per variant at (cx, cy); trajectories use circles everywhere. `edge`
   // (a color, or null for none) outlines the glyph; the X glyph has no fill, so its edge
@@ -191,8 +300,10 @@ __BASE_JS__
   // `POINTS` is everything the cell published; `SHOWN` is what the host lets the page keep
   // (see `onExcludeMessage`). Every computation below reads `SHOWN`, so an excluded method is
   // absent from the front, the axes and the chips alike.
+  // With subsets, `SHOWN` also keeps only the current subset's points.
   const ALL_POINTS = POINTS.slice();
   let SHOWN = ALL_POINTS;
+  let excludedMethods = new Set();
   const byMethod = new Map();
   function indexPoints() {
     byMethod.clear();
@@ -201,23 +312,58 @@ __BASE_JS__
       byMethod.get(p.method).push(p); // insertion order = builder's point order
     }
   }
-  indexPoints();
+  function refilter() {
+    SHOWN = ALL_POINTS.filter(p => (subsetKey === null || p.subset === subsetKey) && !excludedMethods.has(p.method));
+    indexPoints();
+  }
+  refilter();
+
+  // Display names: what the chart, chips, tooltips and table call a method. `p.method` stays the
+  // method's key everywhere else (the front, the selection, the host's messages). The builder can
+  // preset names (`CONFIG.methodNames`); a method renamed on its chip keeps the name on every subset
+  // and view, and an empty name gives the method its own back.
+  const names = new Map(Object.entries(CONFIG.methodNames || {}));
+  function plainName(method) { return names.get(method) || method; }
+  function displayName(method) { return plainName(method) + leakageMark(method); }
+  function escHtml(text) {
+    return String(text).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  }
 
   const METRICS = CONFIG.metrics;
   let metricKey = METRICS[0].key;
   const metricByKey = {};
   for (const m of METRICS) metricByKey[m.key] = m;
 
-  // Single time axis per explorer (the scatter ships inference time, the
-  // trajectories train time).
-  const X_AXIS = CONFIG.xAxes[0];
-  const xKey = X_AXIS.key;
+  // Time axes offered by the x-axis selector (a single one hides it); the first is shown at
+  // load. `xKey` is the current axis, `xAxis()` its spec.
+  const X_AXES = CONFIG.xAxes;
+  let xKey = X_AXES[0].key;
+  const xAxisByKey = {};
+  for (const a of X_AXES) xAxisByKey[a.key] = a;
+  function xAxis() { return xAxisByKey[xKey]; }
 
   function mval(p, metric) { return p[metric.key]; }
 
-  function computeFront(metric) {
+  // A point is on a view when it has a value on both of its axes (a time axis, on a log scale, also
+  // needs a positive one). Only a page built with `drop_incomplete=False` holds points that lack one;
+  // each view then draws the points it has.
+  function onView(p, metric = metricByKey[metricKey]) {
+    const x = p[xKey], y = mval(p, metric);
+    return x != null && isFinite(x) && (xAxis().scale === "linear" || x > 0) && y != null && isFinite(y);
+  }
+  // `byMethod`, keeping each method's points on the current view.
+  function viewPoints(metric) {
+    const out = new Map();
+    for (const [method, pts] of byMethod) {
+      const kept = pts.filter(p => onView(p, metric));
+      if (kept.length) out.set(method, kept);
+    }
+    return out;
+  }
+
+  function computeFront(metric, among = SHOWN.filter(p => onView(p, metric))) {
     const xk = xKey;
-    const pts = [...SHOWN].sort((a, b) =>
+    const pts = [...among].sort((a, b) =>
       a[xk] - b[xk] || (metric.lowerBetter ? mval(a, metric) - mval(b, metric) : mval(b, metric) - mval(a, metric)));
     const verts = [];
     const methods = new Set();
@@ -241,12 +387,123 @@ __BASE_JS__
   // mid-field on Elo), so a set carried over from the previous metric would leave
   // methods drawn on the front but greyed out. `followFront` drops as soon as the
   // reader picks methods themselves, so their selection is never overwritten.
-  const state = { active: new Set(computeFront(metricByKey[metricKey]).methods), followFront: true };
+  // `hideOff` hides the unselected methods' points rather than greying them out.
+  const state = {
+    active: new Set(computeFront(metricByKey[metricKey]).methods), followFront: true, hideOff: !!CONFIG.hideUnselected,
+  };
+  // Methods the host asks every chart to follow (`onFollowMessage`): drawn as active whatever the
+  // chips select, and ringed. `hovered` is the method under the pointer in another chart of the
+  // page (`onHoverMessage`), and `scale` the last render's axes, to ring it without a redraw.
+  let followed = new Set();
+  let hovered = null;
+  let scale = null;
+  let hoverMark = null;
+
+  // ---------- axis limits ----------
+  // Typed per view: each (subset, metric, time axis) keeps its own limits, so a range set for one
+  // view stays with it while another is shown. A side left empty, or one the axis cannot use (x
+  // must be above 0 on the log axis, and min below max), falls back to the automatic limit.
+  const LIMIT_KEYS = ["xmin", "xmax", "ymin", "ymax"];
+  const limitInputs = {};
+  for (const k of LIMIT_KEYS) limitInputs[k] = document.getElementById("lim-" + k);
+  const limitsByView = new Map();
+  function viewKey() { return JSON.stringify([subsetKey, metricKey, xKey]); }
+  function typedLimits() { return limitsByView.get(viewKey()) || {}; }
+  // [lo, hi] from the typed limits where they make a range, else the automatic ones, and which
+  // typed sides went unused.
+  function axisRange(lo, hi, autoLo, autoHi, positive) {
+    const usable = v => v != null && isFinite(v) && (!positive || v > 0);
+    const a = usable(lo) ? lo : autoLo, b = usable(hi) ? hi : autoHi;
+    if (a < b) return { lo: a, hi: b, badLo: lo != null && !usable(lo), badHi: hi != null && !usable(hi) };
+    return { lo: autoLo, hi: autoHi, badLo: lo != null, badHi: hi != null };
+  }
+  function fmtLimit(v) {
+    const a = Math.abs(v);
+    return a >= 100 ? v.toFixed(0) : a >= 1 ? v.toFixed(2) : v.toPrecision(2);
+  }
+  // The boxes show the current view: its typed values and, as placeholders, the automatic limits
+  // they would replace. A box holding text not yet entered (Enter or leaving it) keeps that text.
+  function showLimits(auto, xr, yr) {
+    const typed = typedLimits();
+    const bad = { xmin: xr.badLo, xmax: xr.badHi, ymin: yr.badLo, ymax: yr.badHi };
+    for (const k of LIMIT_KEYS) {
+      const input = limitInputs[k];
+      input.placeholder = fmtLimit(auto[k]);
+      if (!input.dataset.editing) input.value = typed[k] == null ? "" : String(typed[k]);
+      input.setAttribute("aria-invalid", String(bad[k]));
+      const positive = k.startsWith("x") && xAxis().scale !== "linear";
+      input.title = bad[k] ? (positive ? "Not used: x must be above 0, and min below max" : "Not used: min must be below max") : "";
+    }
+    // A metric on the x-axis (linear) may be negative.
+    limitInputs.xmin.min = limitInputs.xmax.min = xAxis().scale === "linear" ? "" : "0";
+  }
+  for (const k of LIMIT_KEYS) {
+    limitInputs[k].addEventListener("input", ev => { ev.target.dataset.editing = "1"; });
+    limitInputs[k].addEventListener("change", ev => {
+      delete ev.target.dataset.editing;
+      const text = ev.target.value.trim();
+      const typed = { ...typedLimits(), [k]: text === "" ? null : Number(text) };
+      if (LIMIT_KEYS.every(key => typed[key] == null)) limitsByView.delete(viewKey());
+      else limitsByView.set(viewKey(), typed);
+      render();
+    });
+  }
+  titleInput.addEventListener("input", ev => {
+    titleBySubset.set(subsetKey, ev.target.value);
+    render();
+  });
+  document.getElementById("btn-auto-limits").addEventListener("click", () => {
+    limitsByView.delete(viewKey());
+    for (const k of LIMIT_KEYS) {
+      delete limitInputs[k].dataset.editing;
+      limitInputs[k].value = "";
+    }
+    render();
+  });
+
+  // ---------- chart size ----------
+  // Typed for the page rather than per view, so a figure keeps its size whichever subset or axes it
+  // shows. An empty box takes the automatic size (the panel's width, `CHART_H` tall, both shown as
+  // placeholders); a size below the minimum is not used and is outlined dashed. The height is the
+  // plot's: a figure title adds its row above it.
+  const SIZE_KEYS = ["w", "h"];
+  const SIZE_MIN = { w: 240, h: 200 };
+  const sizeInputs = { w: document.getElementById("size-w"), h: document.getElementById("size-h") };
+  const typedSize = { w: null, h: null };
+  function usableSize(k) {
+    const v = typedSize[k];
+    return v != null && isFinite(v) && v >= SIZE_MIN[k] ? Math.round(v) : null;
+  }
+  function showSize(auto) {
+    for (const k of SIZE_KEYS) {
+      const bad = typedSize[k] != null && usableSize(k) == null;
+      sizeInputs[k].placeholder = String(auto[k]);
+      sizeInputs[k].setAttribute("aria-invalid", String(bad));
+      sizeInputs[k].title = bad ? `Not used: at least ${SIZE_MIN[k]} px` : "";
+    }
+  }
+  for (const k of SIZE_KEYS) {
+    sizeInputs[k].addEventListener("change", ev => {
+      const text = ev.target.value.trim();
+      typedSize[k] = text === "" ? null : Number(text);
+      render();
+    });
+  }
+  document.getElementById("btn-auto-size").addEventListener("click", () => {
+    for (const k of SIZE_KEYS) {
+      typedSize[k] = null;
+      sizeInputs[k].value = "";
+    }
+    render();
+  });
 
   // ---------- chart ----------
   // A flat, fixed-height plot: two of these panels then fit on one screen.
   const CHART_H = 400;
-  const M = { l: 62, r: 18, t: 14, b: 52 };
+  const M_PLOT = { l: 62, r: 18, t: 14, b: 52 };
+  // The figure title's row above the plot, when there is a title.
+  const TITLE_H = 30;
+  let M = M_PLOT;
 
   function render() {
     // Nothing usable to measure yet: the frame is in a collapsed or hidden container, where
@@ -257,37 +514,72 @@ __BASE_JS__
     if (!box.clientWidth) return;
     const metric = metricByKey[metricKey];
     svg.textContent = "";
-    const W = Math.max(360, Math.round(box.clientWidth));
-    const H = CHART_H;
+    const autoW = Math.max(360, Math.round(box.clientWidth));
+    const W = usableSize("w") || autoW;
+    const title = figTitle().trim();
+    M = title ? { ...M_PLOT, t: M_PLOT.t + TITLE_H } : M_PLOT;
+    const H = (usableSize("h") || CHART_H) + (title ? TITLE_H : 0);
+    showSize({ w: autoW, h: CHART_H });
     svg.setAttribute("width", W);
     svg.setAttribute("height", H);
+    // The legend wraps to a typed width too: the exports are as wide as the wider of the two.
+    legendStrip.style.maxWidth = usableSize("w") ? W + "px" : "";
     // Keep the chip list from outgrowing the chart beside it.
     chipsBox.style.maxHeight = Math.max(170, H - controlsBox.offsetHeight + 20) + "px";
 
-    // x scale (log)
-    const xsAll = SHOWN.map(p => p[xKey]);
-    const xmin = Math.min(...xsAll) * 0.65, xmax = Math.max(...xsAll) * 1.6;
-    const lx0 = Math.log10(xmin), lx1 = Math.log10(xmax);
-    const X = v => M.l + (Math.log10(v) - lx0) / (lx1 - lx0) * (W - M.l - M.r);
-
-    const vals = SHOWN.map(p => mval(p, metric));
-    let y0, y1;
+    // Automatic limits from the points on the view, replaced by the view's typed ones where usable.
+    const VIEW = SHOWN.filter(p => onView(p, metric));
+    const viewBy = viewPoints(metric);
+    const linearX = xAxis().scale === "linear";
+    const xsAll = VIEW.length ? VIEW.map(p => p[xKey]) : (linearX ? [0, 1] : [1, 10]);
+    const vals = VIEW.length ? VIEW.map(p => mval(p, metric)) : [0, 1];
+    const xPad = (Math.max(...xsAll) - Math.min(...xsAll)) * 0.07 || 1;
+    const auto = linearX
+      ? { xmin: Math.min(...xsAll) - xPad, xmax: Math.max(...xsAll) + xPad }
+      : { xmin: Math.min(...xsAll) * 0.65, xmax: Math.max(...xsAll) * 1.6 };
     if (metric.fromZero) {
-      y0 = 0; y1 = Math.max(...vals) * 1.07;
+      auto.ymin = 0; auto.ymax = Math.max(...vals) * 1.07;
     } else {
       const pad = (Math.max(...vals) - Math.min(...vals)) * 0.07;
-      y0 = Math.min(...vals) - pad; y1 = Math.max(...vals) + pad;
+      auto.ymin = Math.min(...vals) - pad; auto.ymax = Math.max(...vals) + pad;
     }
+    const typed = typedLimits();
+    const xr = axisRange(typed.xmin, typed.xmax, auto.xmin, auto.xmax, !linearX);
+    const yr = axisRange(typed.ymin, typed.ymax, auto.ymin, auto.ymax, false);
+    showLimits(auto, xr, yr);
+
+    // x scale: log for a time axis, linear for a metric one
+    const xmin = xr.lo, xmax = xr.hi;
+    const xt = v => (linearX ? v : Math.log10(v));
+    const lx0 = xt(xmin), lx1 = xt(xmax);
+    const X = v => M.l + (xt(v) - lx0) / (lx1 - lx0) * (W - M.l - M.r);
+    const y0 = yr.lo, y1 = yr.hi;
     const Y = v => M.t + (1 - (v - y0) / (y1 - y0)) * (H - M.t - M.b);
+    const inView = p => p[xKey] >= xmin && p[xKey] <= xmax && mval(p, metric) >= y0 && mval(p, metric) <= y1;
 
     // grid + axes
     const grid = el("g", {}, svg);
-    for (let e = Math.ceil(lx0); Math.pow(10, e) < xmax; e++) {
-      const gx = X(Math.pow(10, e));
+    // A log axis ticks its decades, and on a range under two decades wide (e.g. a narrow typed
+    // range) 2x and 5x too; a linear one ticks round steps.
+    const xTicks = [];
+    if (linearX) {
+      const tv = ticks(xmin, xmax, 6);
+      const decimals = Math.max(0, Math.ceil(-Math.log10(tv.length > 1 ? tv[1] - tv[0] : 1) - 1e-9));
+      for (const v of tv) xTicks.push({ v, label: fmtNum(v, decimals) });
+    } else {
+      const steps = lx1 - lx0 < 2 ? [1, 2, 5] : [1];
+      for (let e = Math.floor(lx0); e <= Math.ceil(lx1); e++) {
+        for (const d of steps) {
+          const v = d * Math.pow(10, e);
+          if (v >= xmin && v <= xmax) xTicks.push({ v, label: fmtNum(v, e >= 0 ? 0 : -e) });
+        }
+      }
+    }
+    for (const t of xTicks) {
+      const gx = X(t.v);
       el("line", { x1: gx, y1: M.t, x2: gx, y2: H - M.b, stroke: "var(--line)", "stroke-width": 1 }, grid);
-      const lbl = fmtNum(Math.pow(10, e), e >= 0 ? 0 : -e);
       el("text", { x: gx, y: H - M.b + 20, "text-anchor": "middle", "font-size": 12.5, fill: "var(--muted)" }, grid)
-        .textContent = lbl;
+        .textContent = t.label;
     }
     for (const yv of ticks(y0, y1, 6)) {
       const gy = Y(yv);
@@ -296,39 +588,76 @@ __BASE_JS__
         .textContent = fmtNum(yv, Number.isInteger(yv) ? 0 : metric.decimals);
     }
     el("rect", { x: M.l, y: M.t, width: W - M.l - M.r, height: H - M.t - M.b, fill: "none", stroke: "var(--line)" }, grid);
+    // The axis title shortens where the chart is too narrow for it (a tile half the page wide):
+    // first without the aggregation, then to the selector's own label.
+    const full = xAxis().axisLabel;
+    const titles = [full, full.replace(", median over datasets", ""), xAxis().label];
+    const xTitle = titles.find(t => axisTitleWidth(t) <= W - M.l - M.r) || titles[titles.length - 1];
     el("text", {
       x: (M.l + W - M.r) / 2, y: H - 10, "text-anchor": "middle", "font-size": 14,
       "font-weight": 650, fill: "var(--ink)",
-    }, grid).textContent = X_AXIS.axisLabel;
+    }, grid).textContent = xTitle;
     el("text", {
       x: 0, y: 0, "text-anchor": "middle", "font-size": 14, "font-weight": 650, fill: "var(--ink)",
       transform: `translate(16 ${(M.t + H - M.b) / 2}) rotate(-90)`,
     }, grid).textContent = metric.axisLabel;
 
-    drawOptimalArrow(grid, metric.lowerBetter, M, W, H);
+    if (title) {
+      // Centred over the plot, and set smaller where the chart is too narrow for it.
+      const room = W - M.l - M.r;
+      const size = Math.max(11, Math.min(16, 16 * room / Math.max(1, figTitleWidth(title))));
+      el("text", {
+        x: (M.l + W - M.r) / 2, y: M_PLOT.t + 12, "text-anchor": "middle", "font-size": size,
+        "font-weight": 700, fill: "var(--ink)",
+      }, grid).textContent = title;
+    }
 
-    // pareto front (always shown)
-    const front = computeFront(metric);
+    // A Pareto front (and the optimal corner) is drawn for a metric against time only: a gap has no
+    // better side to trade against time, and a metric on the x-axis is no cost.
+    const drawFront = !linearX && metric.front !== false;
+    if (drawFront) drawOptimalArrow(grid, metric.lowerBetter, M, W, H);
+
+    // Everything drawn from the data sits in the plot's clip, so typed limits cut it at the frame
+    // (and points outside them take no hover).
+    const clip = el("clipPath", { id: "plotclip" }, el("defs", {}, svg));
+    el("rect", { x: M.l, y: M.t, width: W - M.l - M.r, height: H - M.t - M.b }, clip);
+    const plot = el("g", { "clip-path": "url(#plotclip)" }, svg);
+
+    const isOn = m => state.active.has(m) || followed.has(m);
+    // The points drawn: every point, or with `hideOff` the selected methods' only. The axes'
+    // automatic limits stay those of every point, so they hold still while methods are toggled.
+    const visible = state.hideOff ? VIEW.filter(p => isOn(p.method)) : VIEW;
+
+    // pareto front, of the points drawn (see `drawFront`)
+    const front = computeFront(metric, visible);
     const fv = front.verts;
-    if (fv.length) {
+    if (drawFront && fv.length) {
       let d = `M${X(fv[0][0])},${metric.lowerBetter ? M.t : H - M.b}`;
       for (const [fx, fy] of fv) d += ` L${X(fx)},${Y(fy)}`;
       d += ` L${W - M.r},${Y(fv[fv.length - 1][1])}`;
-      el("path", { d, fill: "none", stroke: "var(--ink)", "stroke-width": 1.6, "stroke-dasharray": "7 5", opacity: 0.85 }, svg);
+      el("path", { d, fill: "none", stroke: "var(--ink)", "stroke-width": 1.6, "stroke-dasharray": "7 5", opacity: 0.85 }, plot);
     }
 
-    const isOn = m => state.active.has(m);
+    // y = x, where the x-axis shows the y-axis's metric on validation.
+    if (xAxis().diagonalWith === metricKey) {
+      const lo = Math.max(xmin, y0), hi = Math.min(xmax, y1);
+      if (lo < hi) {
+        el("line", {
+          x1: X(lo), y1: Y(lo), x2: X(hi), y2: Y(hi), stroke: "var(--muted)", "stroke-width": 1.2, "stroke-dasharray": "4 4",
+        }, plot);
+      }
+    }
 
     // connectors: variant links (scatter) / the trajectory itself
-    const conn = el("g", {}, svg);
-    for (const [method, pts] of byMethod) {
+    const conn = el("g", {}, plot);
+    for (const [method, pts] of viewBy) {
       if (pts.length < 2) continue;
       const on = isOn(method);
-      if (!TRAJECTORY && !on) continue; // scatter: connectors only for active methods
+      if (!on && (!TRAJECTORY || state.hideOff)) continue; // scatter: connectors only for active methods
       const dd = pts.map((p, i) => `${i ? "L" : "M"}${X(p[xKey])},${Y(mval(p, metric))}`).join(" ");
       el("path", {
         d: dd, fill: "none",
-        stroke: on ? FAM_VAR[pts[0].family] : "var(--pt-muted)",
+        stroke: on ? famColor(pts[0]) : "var(--pt-muted)",
         "stroke-width": on ? (TRAJECTORY ? 2 : 1.4) : 1,
         opacity: on ? 0.6 : 0.35,
         "data-m": method,
@@ -336,16 +665,17 @@ __BASE_JS__
     }
 
     // points: inactive first, active on top
-    const ptsOff = el("g", {}, svg);
-    const ptsOn = el("g", {}, svg);
-    for (const [method, pts] of byMethod) {
+    const ptsOff = el("g", {}, plot);
+    const ptsOn = el("g", {}, plot);
+    for (const [method, pts] of viewBy) {
       const on = isOn(method);
+      if (!on && state.hideOff) continue;
       for (const p of pts) {
-        const color = on ? FAM_VAR[p.family] : "var(--pt-muted)";
+        const color = on ? famColor(p) : "var(--pt-muted)";
         // An active marker's edge is a darker shade of its face on the light surface and
         // the card color on the dark one (the --fam-*-edge tokens). Muted markers stay
         // plain grey, easy to ignore.
-        const edge = on ? FAM_EDGE[p.family] : null;
+        const edge = on ? famEdge(p) : null;
         // With `dimOffFront`, an active point that is not a vertex of the front is drawn
         // smaller and fainter, so the front members carry the eye.
         const dim = CONFIG.dimOffFront && on && !front.points.has(p);
@@ -361,20 +691,35 @@ __BASE_JS__
       }
     }
 
+    // Followed methods keep their family colour and gain a ring, on every chart of the page at
+    // once; a trajectory rings its end point only, as the imputation ring does.
+    const rings = el("g", { "pointer-events": "none" }, plot);
+    for (const method of followed) {
+      const pts = viewBy.get(method);
+      if (!pts) continue;
+      for (const p of TRAJECTORY ? pts.slice(-1) : pts) {
+        el("circle", {
+          cx: X(p[xKey]), cy: Y(mval(p, metric)), r: 10.5, fill: "none",
+          stroke: "var(--accent)", "stroke-width": 2.2,
+        }, rings);
+      }
+    }
+
     // Labels for active methods at their best point. Each one is measured, so it
     // can be put on whichever side of its point has room for the whole name and
     // held inside the plot — a system carries its configuration in its name
     // ("AutoGluon 1.6 (noncommercial, 4h)") and would otherwise run off the edge.
     const labels = [];
-    for (const [method, pts] of byMethod) {
+    for (const [method, pts] of viewBy) {
       if (!isOn(method)) continue;
       const best = pts.reduce((a, b) =>
         (metric.lowerBetter ? mval(a, metric) < mval(b, metric) : mval(a, metric) > mval(b, metric)) ? a : b);
+      if (!inView(best)) continue;
       const px = X(best[xKey]);
-      const w = textWidth(method);
+      const w = textWidth(displayName(method));
       const toRight = px + 10 + w <= W - M.r;
       labels.push({
-        method, family: best.family, w,
+        method, family: best.family, shade: best.shade, w,
         anchor: toRight ? "start" : "end",
         // Anchored at its start the label runs right from `x`, at its end it runs
         // left to `x`; either way keep the far side off the plot frame.
@@ -399,22 +744,49 @@ __BASE_JS__
     for (const l of labels) {
       const t = el("text", {
         x: l.x, y: Math.max(l.y, M.t + 12), "font-size": 13, "font-weight": 700,
-        fill: FAM_VAR[l.family], "paint-order": "stroke", stroke: "var(--card)", "stroke-width": 3.5,
+        fill: famColor(l), "paint-order": "stroke", stroke: "var(--card)", "stroke-width": 3.5,
         "text-anchor": l.anchor,
       }, lg);
-      t.textContent = l.method;
+      t.textContent = displayName(l.method);
     }
 
     // invisible hit targets on top (bigger than marks)
-    const hits = el("g", {}, svg);
-    for (const p of POINTS) {
+    const hits = el("g", {}, plot);
+    for (const p of visible) {
       const h = el("circle", { cx: X(p[xKey]), cy: Y(mval(p, metric)), r: 12, fill: "transparent", cursor: "pointer" }, hits);
-      h.addEventListener("mouseenter", ev => showTip(p, ev));
+      h.addEventListener("mouseenter", ev => { showTip(p, ev); postHover(p.method); });
       h.addEventListener("mousemove", ev => tip.move(ev));
-      h.addEventListener("mouseleave", () => hideTip(p.method));
-      h.addEventListener("click", () => toggle(p.method));
+      h.addEventListener("mouseleave", () => { hideTip(p.method); postHover(null); });
+      h.addEventListener("click", () => pickMethod(p.method, () => toggle(p.method)));
+    }
+    scale = { X, Y, metric, plot };
+    hoverMark = null;
+    markHovered();
+  }
+
+  // Ring the method under the pointer in another chart of the page, dashed so it does not read
+  // as followed. Drawn on top, but without hit area, so it never takes this chart's own hover.
+  function markHovered() {
+    if (hoverMark) hoverMark.remove();
+    hoverMark = null;
+    const pts = hovered && scale ? (byMethod.get(hovered) || []).filter(p => onView(p, scale.metric)) : [];
+    if (!pts.length) return;
+    hoverMark = el("g", { "pointer-events": "none" }, scale.plot);
+    for (const p of pts) {
+      el("circle", {
+        cx: scale.X(p[xKey]), cy: scale.Y(mval(p, scale.metric)), r: 9.5, fill: "none",
+        stroke: "var(--ink)", "stroke-width": 1.8, "stroke-dasharray": "3 2.5",
+      }, hoverMark);
     }
   }
+  onHoverMessage(method => {
+    hovered = method;
+    markHovered();
+  });
+  onFollowMessage(names => {
+    followed = names;
+    render();
+  });
 
   // Temporary hover emphasis without a re-render (a re-render would replace
   // the hit node under the cursor mid-hover).
@@ -433,14 +805,15 @@ __BASE_JS__
   function showTip(p, ev) {
     emphasize(p.method, true);
     const sub = TRAJECTORY ? (p.n_configs != null ? `${p.n_configs} configs` : "") : (p.variant || "");
-    let html = `<div class="t-name">${p.method}` + (sub ? ` <span class="t-var">(${sub})</span>` : "") + "</div>" +
-      `<div>${p.family}</div>`;
+    let html = `<div class="t-name">${escHtml(displayName(p.method))}` + (sub ? ` <span class="t-var">(${sub})</span>` : "") + "</div>" +
+      (names.has(p.method) ? `<div class="t-var">${escHtml(p.method)}</div>` : "") +
+      `<div>${famLabel(p)}</div>`;
     for (const m of METRICS) {
       html += `<div>${m.label}: <b>${fmtMetric(m, mval(p, m))}</b></div>`;
     }
-    html += `<div>${X_AXIS.short}: <b>${fmtTime(p[xKey])}</b></div>`;
+    html += `<div>${xAxis().short}: <b>${fmtTime(p[xKey])}</b></div>`;
     if (p.imputed) html += `<div class="t-imp">Imputed on ${fmtNum(p.imputed_pct, 0)}% of datasets</div>`;
-    tip.show(html, ev);
+    tip.show(html + PICK_HINT, ev);
   }
   function hideTip(method) {
     emphasize(method, false);
@@ -481,33 +854,103 @@ __BASE_JS__
       const set = document.createElement("div");
       set.className = "chipset";
       for (const m of methods) {
+        const wrap = document.createElement("span");
+        wrap.className = "chipwrap";
         const b = document.createElement("button");
         b.className = "chip";
-        b.style.setProperty("--fam", FAM_VAR[fam]);
-        const imputed = byMethod.get(m).some(p => p.imputed);
+        b.style.setProperty("--fam", famColor(byMethod.get(m)[0]));
         const label = document.createElement("span");
-        label.textContent = m;
+        label.className = "chip-label";
         b.appendChild(Object.assign(document.createElement("span"), { className: "dot" }));
         b.appendChild(label);
-        if (imputed) {
+        if (byMethod.get(m).some(p => p.imputed)) {
           const mark = document.createElement("span");
           mark.className = "imp-mark";
           mark.textContent = "‡";
           b.appendChild(mark);
         }
-        b.title = m + (imputed ? " — partially imputed" : "");
         b.addEventListener("click", () => toggle(m));
-        set.appendChild(b);
+        const edit = document.createElement("button");
+        edit.className = "chip-edit";
+        edit.textContent = "✎";
+        edit.addEventListener("click", ev => { ev.stopPropagation(); startRename(m, wrap, b, edit); });
+        wrap.appendChild(b);
+        wrap.appendChild(edit);
+        set.appendChild(wrap);
         chipByMethod.set(m, b);
+        nameChip(m);
       }
       row.appendChild(set);
       chipsBox.appendChild(row);
     }
   }
+  // A chip's label and hover text from the method's display name.
+  function nameChip(m) {
+    const b = chipByMethod.get(m);
+    const imputed = byMethod.has(m) && byMethod.get(m).some(p => p.imputed);
+    b.querySelector(".chip-label").textContent = displayName(m);
+    b.title = displayName(m) + (names.has(m) ? ` (${m})` : "") + (imputed ? " — partially imputed" : "");
+    b.parentElement.querySelector(".chip-edit").title = `Rename ${displayName(m)}`;
+    b.parentElement.querySelector(".chip-edit").setAttribute("aria-label", `Rename ${displayName(m)}`);
+  }
+  // The rename box opens in the chip's place: Enter or leaving the box applies the name, Escape
+  // keeps the old one. Both keys stop at the box (Escape elsewhere opens paper view, and an Enter
+  // reaching the chip would toggle it); closed from the keyboard, the box hands the focus back to its
+  // chip on the next frame.
+  function startRename(m, wrap, chip, edit) {
+    const input = document.createElement("input");
+    input.className = "chip-rename";
+    input.type = "text";
+    input.spellcheck = false;
+    input.value = plainName(m);
+    input.placeholder = m;
+    input.size = Math.max(9, input.value.length + 1);
+    input.setAttribute("aria-label", `New name for ${m}`);
+    chip.hidden = true;
+    edit.hidden = true;
+    wrap.insertBefore(input, chip);
+    input.focus();
+    input.select();
+    let open = true;
+    function close(apply, refocus) {
+      if (!open) return;
+      open = false;
+      input.remove();
+      chip.hidden = false;
+      edit.hidden = false;
+      if (apply) setName(m, input.value);
+      if (refocus) requestAnimationFrame(() => chip.focus());
+    }
+    input.addEventListener("keydown", ev => {
+      if (ev.key !== "Enter" && ev.key !== "Escape") return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      close(ev.key === "Enter", true);
+    });
+    input.addEventListener("blur", () => close(true, false));
+  }
+  const resetNamesBtn = document.getElementById("btn-reset-names");
+  function setName(m, text) {
+    const name = text.trim();
+    if (!name || name === m) names.delete(m); else names.set(m, name);
+    refreshNames();
+  }
+  function refreshNames() {
+    for (const m of chipByMethod.keys()) nameChip(m);
+    resetNamesBtn.hidden = !names.size;
+    buildTable();
+    render();
+  }
+  resetNamesBtn.addEventListener("click", () => {
+    names.clear();
+    refreshNames();
+  });
+  resetNamesBtn.hidden = !names.size;
+
   function syncChips() {
     for (const [m, b] of chipByMethod) {
       b.setAttribute("aria-pressed", String(state.active.has(m)));
-      b.hidden = !byMethod.has(m);
+      b.parentElement.hidden = !byMethod.has(m);
     }
     for (const [fam, b] of famChips) {
       const methods = familyMethods(fam);
@@ -520,8 +963,8 @@ __BASE_JS__
   // points and drops the excluded methods from the active set; a chart that was following
   // the front recomputes it over what is left.
   onExcludeMessage(excluded => {
-    SHOWN = ALL_POINTS.filter(p => !excluded.has(p.method));
-    indexPoints();
+    excludedMethods = excluded;
+    refilter();
     for (const m of [...state.active]) if (!byMethod.has(m)) state.active.delete(m);
     if (state.followFront) state.active = new Set(computeFront(metricByKey[metricKey]).methods);
     syncChips();
@@ -552,14 +995,44 @@ __BASE_JS__
   function showFront() {
     setActive(computeFront(metricByKey[metricKey]).methods, true);
   }
-  // Switching the y-axis moves the front, so the highlighted set moves with it.
+  // Switching an axis moves the front, so the highlighted set moves with it.
   function setMetric(key) {
     metricKey = key;
     if (state.followFront) showFront(); else render();
   }
+  function setXAxis(key) {
+    xKey = key;
+    buildTable();
+    if (state.followFront) showFront(); else render();
+  }
+  // Another subset brings its own points, so the chips, legend and table are rebuilt; the highlighted
+  // methods stay where the subset has them.
+  function setSubset(key) {
+    subsetKey = key;
+    refilter();
+    chipsBox.innerHTML = "";
+    chipByMethod.clear();
+    famChips.clear();
+    buildChips();
+    for (const m of [...state.active]) if (!byMethod.has(m)) state.active.delete(m);
+    if (state.followFront) state.active = new Set(computeFront(metricByKey[metricKey]).methods);
+    showTitle();
+    buildLegend();
+    buildTable();
+    syncChips();
+    render();
+  }
   document.getElementById("btn-front").addEventListener("click", showFront);
   document.getElementById("btn-all").addEventListener("click", () => setActive([...byMethod.keys()]));
   document.getElementById("btn-none").addEventListener("click", () => setActive([]));
+  const hideOffBtn = document.getElementById("btn-hide-off");
+  hideOffBtn.style.setProperty("--fam", "var(--accent)");
+  hideOffBtn.setAttribute("aria-pressed", String(state.hideOff));
+  hideOffBtn.addEventListener("click", () => {
+    state.hideOff = !state.hideOff;
+    hideOffBtn.setAttribute("aria-pressed", String(state.hideOff));
+    render();
+  });
 
   // metric selector (hidden when only one metric is configured)
   const metricPick = document.getElementById("metricpick");
@@ -575,6 +1048,46 @@ __BASE_JS__
     metricSelect.addEventListener("change", ev => setMetric(ev.target.value));
   }
 
+  // subset selector (hidden when the page holds no subsets)
+  const subsetPick = document.getElementById("subsetpick");
+  const subsetSelect = document.getElementById("subset-select");
+  if (SUBSETS) {
+    subsetPick.hidden = false;
+    for (const s of SUBSETS) {
+      const opt = document.createElement("option");
+      opt.value = s.key;
+      opt.textContent = s.label;
+      subsetSelect.appendChild(opt);
+    }
+    subsetSelect.addEventListener("change", ev => setSubset(ev.target.value));
+  }
+
+  // x-axis selector (hidden when only one time axis is configured); axes that name a `group`
+  // (e.g. "Median, per 1K samples") are listed under it
+  const xAxisPick = document.getElementById("xaxispick");
+  const xAxisSelect = document.getElementById("xaxis-select");
+  if (X_AXES.length > 1) {
+    xAxisPick.hidden = false;
+    const groups = new Map();
+    for (const a of X_AXES) {
+      const opt = document.createElement("option");
+      opt.value = a.key;
+      opt.textContent = a.label;
+      if (a.group) {
+        if (!groups.has(a.group)) {
+          const og = document.createElement("optgroup");
+          og.label = a.group;
+          groups.set(a.group, og);
+          xAxisSelect.appendChild(og);
+        }
+        groups.get(a.group).appendChild(opt);
+      } else {
+        xAxisSelect.appendChild(opt);
+      }
+    }
+    xAxisSelect.addEventListener("change", ev => setXAxis(ev.target.value));
+  }
+
   // Embedded, the host can pick the metric for us: the leaderboard's "I care about" control
   // decides whether the page leads with Elo or Improvability, and every panel follows without
   // regenerating an artifact per metric. Ignored when the metric is not one this chart offers.
@@ -582,9 +1095,19 @@ __BASE_JS__
   // here (or a paper-view toggle) changes the height. So a repeat of the host's last message is
   // ignored outright, rather than compared with the metric on screen: otherwise the reader's
   // own pick would be undone by the echo of a choice the host had already made.
+  // The host can pick the time axis the same way (``tabarena-explorer-xaxis``).
   let lastHostMetric = null;
+  let lastHostXAxis = null;
   window.addEventListener("message", ev => {
     const d = ev.data;
+    if (d && d.type === "tabarena-explorer-xaxis") {
+      if (d.xaxis === lastHostXAxis) return;
+      lastHostXAxis = d.xaxis;
+      if (!X_AXES.some(a => a.key === d.xaxis) || d.xaxis === xKey) return;
+      if (xAxisSelect) xAxisSelect.value = d.xaxis;
+      setXAxis(d.xaxis);
+      return;
+    }
     if (!d || d.type !== "tabarena-explorer-metric") return;
     if (d.metric === lastHostMetric) return;
     lastHostMetric = d.metric;
@@ -603,25 +1126,32 @@ __BASE_JS__
         '<span class="item"><svg width="14" height="14" viewBox="0 0 14 14"><rect x="2" y="2" width="10" height="10" rx="1.5" fill="var(--muted)"/></svg> Tuned</span>' +
         '<span class="item"><svg width="14" height="14" viewBox="0 0 14 14"><path d="M3,3 L11,11 M3,11 L11,3" stroke="var(--muted)" stroke-width="2.6" stroke-linecap="round"/></svg> Tuned + Ensembled</span>';
       // Systems draw as diamonds; the legend names them as the leaderboard table does.
-      if (POINTS.some(p => p.variant === "End-to-end")) {
+      if (SHOWN.some(p => p.variant === "End-to-end")) {
         html += '<span class="item" title="A system picked, tuned and combined its own models inside one budget; the tuning regimes do not apply to it"><svg width="14" height="14" viewBox="0 0 14 14"><rect x="3" y="3" width="8" height="8" rx="1" fill="var(--muted)" transform="rotate(45 7 7)"/></svg> End-to-end</span>';
       }
     } else {
       html += '<span class="item"><svg width="26" height="8" viewBox="0 0 26 8"><line x1="0" y1="4" x2="26" y2="4" stroke="var(--muted)" stroke-width="2"/><circle cx="6" cy="4" r="2.6" fill="var(--muted)"/><circle cx="16" cy="4" r="2.6" fill="var(--muted)"/></svg> Tuning trajectory (more configs &rarr; more time)</span>';
     }
-    html += '<span class="item"><svg width="26" height="8" viewBox="0 0 26 8"><line x1="0" y1="4" x2="26" y2="4" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="6 4"/></svg> Pareto front (always shown)</span>';
-    if (POINTS.some(p => p.imputed)) {
+    // A page with views that draw no front (a gap metric, a metric x-axis) says where the front shows, and names the
+    // y = x line of its validation against test views.
+    const someFrontless = METRICS.some(m => m.front === false) || X_AXES.some(a => a.scale === "linear");
+    html += '<span class="item"><svg width="26" height="8" viewBox="0 0 26 8"><line x1="0" y1="4" x2="26" y2="4" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="6 4"/></svg> ' +
+      (someFrontless ? "Pareto front (a metric against time)" : "Pareto front (always shown)") + "</span>";
+    if (X_AXES.some(a => a.diagonalWith)) {
+      html += '<span class="item"><svg width="26" height="8" viewBox="0 0 26 8"><line x1="0" y1="4" x2="26" y2="4" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 4"/></svg> Test equals validation</span>';
+    }
+    if (SHOWN.some(p => p.imputed)) {
       html += '<span class="item"><svg width="18" height="18" viewBox="0 0 18 18"><circle cx="9" cy="9" r="4" fill="var(--muted)"/><circle cx="9" cy="9" r="7.5" fill="none" stroke="var(--muted)" stroke-width="1.3" stroke-dasharray="3 2.5"/></svg> &Dagger; partially imputed</span>';
     }
     // Model family, named: highlighted points are colored by family, and in paper
     // view the chip list that would otherwise decode them is hidden.
-    const families = FAM_ORDER.filter(f => POINTS.some(p => p.family === f));
-    if (families.length > 1) {
+    const swatches = legendSwatches(SHOWN);
+    if (swatches.length > 1) {
       html += '<span class="legendbreak"></span><span class="item">Family:</span>';
-      for (const fam of families) {
+      for (const sw of swatches) {
         html += `<span class="item"><svg width="12" height="12" viewBox="0 0 12 12">` +
-          `<circle cx="6" cy="6" r="5" fill="${FAM_VAR[fam]}"/></svg> ` +
-          `<span style="color:${FAM_INK[fam]}">${fam}</span></span>`;
+          `<circle cx="6" cy="6" r="5" fill="${sw.color}"/></svg> ` +
+          `<span style="color:${sw.ink}">${sw.label}</span></span>`;
       }
     }
     box2.innerHTML = html;
@@ -629,20 +1159,20 @@ __BASE_JS__
 
   // ---------- paper view ----------
   setUpPaperView(render);
-  setUpExport(() => [{ svg: svg, dx: 0 }], () => slugify(document.title));
+  setUpExport(() => [{ svg: svg, dx: 0 }], () => slugify(figTitle().trim() || document.title));
 
   // ---------- data table ----------
   function buildTable() {
     const m0 = metricByKey[METRICS[0].key];
-    const rows = [...POINTS].sort((a, b) =>
+    const rows = [...SHOWN].sort((a, b) =>
       m0.lowerBetter ? mval(a, m0) - mval(b, m0) : mval(b, m0) - mval(a, m0));
     let html = "<table><thead><tr><th>Method</th>";
     html += TRAJECTORY ? "<th>Configs</th>" : "<th>Variant</th>";
     html += "<th>Family</th>";
     for (const m of METRICS) html += `<th>${m.label}</th>`;
-    html += `<th>${X_AXIS.short}</th><th>Imputed</th></tr></thead><tbody>`;
+    html += `<th>${xAxis().short}</th><th>Imputed</th></tr></thead><tbody>`;
     for (const p of rows) {
-      html += `<tr><td>${p.method}</td><td>${TRAJECTORY ? (p.n_configs != null ? p.n_configs : "—") : p.variant}</td><td>${p.family}</td>`;
+      html += `<tr><td>${escHtml(displayName(p.method))}</td><td>${TRAJECTORY ? (p.n_configs != null ? p.n_configs : "—") : p.variant}</td><td>${p.family}</td>`;
       for (const m of METRICS) html += `<td>${fmtMetric(m, mval(p, m))}</td>`;
       html += `<td>${fmtNum(p[xKey], 3)}</td>`;
       html += `<td>${p.imputed ? fmtNum(p.imputed_pct, 0) + "%" : "—"}</td></tr>`;
@@ -662,6 +1192,44 @@ __BASE_JS__
   // the viewport, and that is the case that leaves a chart stuck at its minimum width.
   redrawOnResize(box, render);
   window.addEventListener("load", postHeight);
+
+  // ---------- saved view ----------
+  // Everything the reader set: the subset and axes, the selection (or following the front), the
+  // hidden-unselected toggle, and the titles, limits, size and names typed on the page.
+  function currentView() {
+    return {
+      subset: subsetKey, metric: metricKey, xAxis: xKey, active: [...state.active], followFront: state.followFront,
+      hideOff: state.hideOff, titles: [...titleBySubset], limits: [...limitsByView], size: { ...typedSize },
+      names: [...names],
+    };
+  }
+  // A saved view, applied before the first render; parts the page cannot use (a subset or axis it
+  // does not have, a method missing from the subset) are dropped.
+  function restoreView(v) {
+    if (SUBSETS && SUBSETS.some(s => s.key === v.subset)) subsetKey = v.subset;
+    if (metricByKey[v.metric]) metricKey = v.metric;
+    if (xAxisByKey[v.xAxis]) xKey = v.xAxis;
+    refilter();
+    for (const [k, t] of v.titles || []) titleBySubset.set(k, t);
+    for (const [k, l] of v.limits || []) limitsByView.set(k, l);
+    for (const k of SIZE_KEYS) {
+      typedSize[k] = v.size && v.size[k] != null ? Number(v.size[k]) : null;
+      sizeInputs[k].value = typedSize[k] == null ? "" : String(typedSize[k]);
+    }
+    for (const [m, n] of v.names || []) names.set(m, n);
+    state.hideOff = !!v.hideOff;
+    state.followFront = !!v.followFront;
+    state.active = state.followFront
+      ? new Set(computeFront(metricByKey[metricKey]).methods)
+      : new Set((v.active || []).filter(m => byMethod.has(m)));
+    subsetSelect.value = subsetKey;
+    metricSelect.value = metricKey;
+    xAxisSelect.value = xKey;
+    hideOffBtn.setAttribute("aria-pressed", String(state.hideOff));
+    resetNamesBtn.hidden = !names.size;
+    showTitle();
+  }
+  setUpSaveView(PRISTINE, currentView, restoreView, () => slugify(figTitle().trim() || document.title) + "-view");
 
   buildChips();
   buildLegend();

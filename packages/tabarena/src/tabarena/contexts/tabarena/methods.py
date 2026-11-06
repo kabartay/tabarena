@@ -27,6 +27,7 @@ from tabarena.contexts.tabarena._tabarena_method_metadata_2026_01_23_tabprep imp
     tabprep_realtabpfnv250_metadata,
     tabprep_tabm_metadata,
 )
+from tabarena.contexts.tabarena._tabarena_method_metadata_2026_03_18 import tabstar_metadata
 from tabarena.contexts.tabarena._tabarena_method_metadata_2026_08_05 import (
     ag_160_eq_4h_metadata,
     ag_160_noncomm_4h_metadata,
@@ -60,9 +61,16 @@ from tabarena.models.exaone_tabular.info import (
 )
 from tabarena.models.extra_trees.info import extra_trees_new_method_metadata
 from tabarena.models.fastai.info import fastai_method_metadata
+from tabarena.models.ftfm.info import ftfm_method_metadata
 from tabarena.models.iltm.info import iltm_method_metadata
 from tabarena.models.knn.info import knn_method_metadata as knn_metadata
+from tabarena.models.kumo_tabular.info import (
+    kumo_tabular_medium_method_metadata,
+    kumo_tabular_method_metadata,
+    kumo_tabular_small_method_metadata,
+)
 from tabarena.models.lightgbm.info import lightgbm_method_metadata
+from tabarena.models.lightpfn.info import lightpfn_method_metadata
 from tabarena.models.limix.info import limix_method_metadata as limix_metadata
 from tabarena.models.limix_2.info import limix_2_method_metadata
 from tabarena.models.lr.info import (
@@ -83,11 +91,14 @@ from tabarena.models.orionmsp.info import orionmsp_method_metadata as orionmsp_m
 from tabarena.models.perpetual_booster.info import (
     perpetual_booster_method_metadata as perpetualbooster_metadata,
 )
+from tabarena.models.prismboost.info import prismboost_method_metadata
 from tabarena.models.random_forest.info import random_forest_method_metadata
 from tabarena.models.realmlp.info import realmlp_method_metadata as realmlp_gpu_metadata
 from tabarena.models.sap_rpt_oss.info import (
     sap_rpt_oss_method_metadata as contexttab_metadata,
 )
+from tabarena.models.seldon.info import seldon_method_metadata, seldon_mini_method_metadata
+from tabarena.models.tababax.info import tababax_method_metadata
 from tabarena.models.tabdpt.info import (
     tabdpt_method_metadata as tabdpt_metadata,
     tabdpt_turbo_method_metadata,
@@ -116,7 +127,7 @@ from tabarena.models.tabpfnv2_5.info import (
     realtabpfnv25_method_metadata as realtabpfn25_metadata,
     tabpfnv26_method_metadata as tabpfn26_metadata,
 )
-from tabarena.models.tabstar.info import tabstar_method_metadata as tabstar_metadata
+from tabarena.models.tabstar_v1p1.info import tabstar_v1p1_method_metadata
 from tabarena.models.tabswift.info import (
     tabswift_2026_09_method_metadata,
     tabswift_method_metadata,
@@ -126,7 +137,9 @@ from tabarena.models.xgboost.info import xgboost_method_metadata
 from tabarena.models.xrfm.info import xrfm_method_metadata as xrfm_metadata
 
 # Systems (whole pipelines rather than single models) have their own per-system `info.py`.
+from tabarena.systems.chakra_tab.info import chakra_tab_full_metadata, chakra_tab_medium_metadata
 from tabarena.systems.tabfm_plus.info import tabfm_plus_method_metadata
+from tabarena.systems.tabldm_plus.info import tabldm_plus_method_metadata
 
 if TYPE_CHECKING:
     from tabarena.models._method_metadata import MethodMetadata
@@ -185,7 +198,10 @@ tabarena_method_metadata_collection = MethodMetadataCollection(
         ag_150_eq_4h8c_metadata,
         ag_160_eq_4h_metadata,
         ag_160_noncomm_4h_metadata,
+        chakra_tab_full_metadata,
+        chakra_tab_medium_metadata,
         tabfm_plus_method_metadata,
+        tabldm_plus_method_metadata,
         # Default tabular models (CPU)
         aplr_method_metadata,
         catboost_new_method_metadata,
@@ -198,6 +214,7 @@ tabarena_method_metadata_collection = MethodMetadataCollection(
         lr_2026_09_method_metadata,
         fastai_method_metadata,
         nn_torch_method_metadata,
+        prismboost_method_metadata,
         random_forest_method_metadata,
         xgboost_method_metadata,
         # Neural / GPU / foundation models
@@ -215,7 +232,7 @@ tabarena_method_metadata_collection = MethodMetadataCollection(
         realtabpfn25_metadata,
         contexttab_metadata,
         tabiclv2_2026_09_method_metadata,
-        tabstar_metadata,
+        tabstar_v1p1_method_metadata,
         perpetualbooster_metadata,
         tabpfn26_metadata,
         limix_metadata,
@@ -234,12 +251,20 @@ tabarena_method_metadata_collection = MethodMetadataCollection(
         tabpfn_3_5_fast_method_metadata,
         limix_2_method_metadata,
         tabdpt_v13_method_metadata,
+        kumo_tabular_method_metadata,
+        kumo_tabular_medium_method_metadata,
+        kumo_tabular_small_method_metadata,
+        lightpfn_method_metadata,
+        ftfm_method_metadata,
+        tababax_method_metadata,
+        seldon_method_metadata,
+        seldon_mini_method_metadata,
     ],
 )
 
-# Per-model `info.py` metadata that a rerun has replaced. These belong to no dated suite list above,
-# so they are named here to keep their hosted artifacts reachable through the complete collection.
-# Append a method here whenever a rerun takes over its slot in the collection.
+# Metadata that a rerun, or a newer version of the same model, has replaced. These belong to no dated
+# suite list above, so they are named here to keep their hosted artifacts reachable through the complete
+# collection. Append a method here whenever another method takes over its slot in the collection.
 methods_superseded: list[MethodMetadata] = [
     chimeraboost_method_metadata,  # 0.14.1 before the untimed warm-up (suite tabarena-2026-06-30)
     chimeraboost_new_method_metadata,  # 0.14.1 with the warm-up (suite tabarena-2026-07-13)
@@ -257,6 +282,7 @@ methods_superseded: list[MethodMetadata] = [
     causilo_method_metadata,  # rerun tabarena-2026-09-16 replaced it
     mitra_v2_method_metadata,  # rerun tabarena-2026-09-16 replaced it
     tabldm_method_metadata,  # rerun tabarena-2026-09-16 replaced it
+    tabstar_metadata,  # TabSTAR-v1.1 (models/tabstar_v1p1) replaced it
 ]
 
 # All historical results for each method = the latest collection + every superseded variant: the

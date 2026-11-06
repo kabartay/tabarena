@@ -23,6 +23,11 @@ from tabarena.models.catboost.info import catboost_descriptor
 from tabarena.models.causilo.info import causilo_descriptor
 from tabarena.models.exaone_tabular.info import exaone_tabular_descriptor
 from tabarena.models.extra_trees.info import extra_trees_descriptor
+from tabarena.models.kumo_tabular.info import (
+    kumo_tabular_descriptor,
+    kumo_tabular_medium_descriptor,
+    kumo_tabular_small_descriptor,
+)
 from tabarena.models.lightgbm.info import lightgbm_descriptor
 from tabarena.models.limix_2.info import limix_2_descriptor
 from tabarena.models.lr.info import lr_descriptor
@@ -123,6 +128,26 @@ beyond_tabm_metadata = tabm_descriptor.method_metadata(
     **_common_bag_kwargs,
 )
 
+# TabM fix rerun of 2026-10-28 (`beyondarena_tabmfix_28102026` in BENCHMARK_LOG.md): every split of the 14 datasets
+# whose hosted TA-TabM results showed a failure, with the constant-column fix (38b66ba9) and the input clipping
+# (6dd0319f), default + the hosted suite's 25 random configs. It runs the re-implemented TabM (#438); the hosted suite
+# above ran the earlier vendored one.
+beyond_tabm_2026_10_rerun_metadata = tabm_descriptor.method_metadata(
+    method="TA-TabM",
+    ag_key="TA-TABM",
+    config_default="TA-TabM_c1_BAG_L1",
+    **{**_common_bag_kwargs, "suite": "beyondarena-2026-10-28-tabmfix", "date": "2026-10-28"},
+)
+# The hosted suite with those 14 datasets replaced by the rerun: its processed tier merged, every results table
+# regenerated from it (identical to the hosted ones on the other 128 datasets). No raw tier: the hosted suite's raw
+# results were never uploaded; the rerun's are in the suite above.
+beyond_tabm_2026_10_metadata = tabm_descriptor.method_metadata(
+    method="TA-TabM",
+    ag_key="TA-TABM",
+    config_default="TA-TabM_c1_BAG_L1",
+    **{**_common_bag_kwargs, "suite": "beyondarena-2026-10-28", "date": "2026-10-28", "has_raw": False},
+)
+
 # -- Foundation models (GPU, no HPO, unbagged) ---------------------------------------
 beyond_tabdpt_metadata = tabdpt_descriptor.method_metadata(
     method="TA-TabDPT",
@@ -209,6 +234,30 @@ beyond_tabswift_metadata = tabswift_descriptor.method_metadata(
     **_tfm_run_kwargs,
 )
 
+# -- Kumo Tabular, run 2026-10-06 (`beyondarena_kumotabular_core2k_06102026` in BENCHMARK_LOG.md) ---------------
+# The same official protocol on every core2k split, up to the 1M-row tables, with fit time limits of 16 h on the
+# tables above 10k training rows (a recorded deviation from the 4 h default).
+_kumo_run_kwargs = {**_common_fm_kwargs, "suite": "beyondarena-2026-10-06", "date": "2026-10-06", "verified": True}
+
+beyond_kumo_tabular_metadata = kumo_tabular_descriptor.method_metadata(
+    method="TA-Kumo-Tabular",
+    ag_key="TA-KUMO-TABULAR",
+    config_default="TA-Kumo-Tabular_c1_BAG_L1",
+    **_kumo_run_kwargs,
+)
+beyond_kumo_tabular_medium_metadata = kumo_tabular_medium_descriptor.method_metadata(
+    method="TA-Kumo-Tabular-Medium",
+    ag_key="TA-KUMO-TABULAR-MEDIUM",
+    config_default="TA-Kumo-Tabular-Medium_c1_BAG_L1",
+    **_kumo_run_kwargs,
+)
+beyond_kumo_tabular_small_metadata = kumo_tabular_small_descriptor.method_metadata(
+    method="TA-Kumo-Tabular-Small",
+    ag_key="TA-KUMO-TABULAR-SMALL",
+    config_default="TA-Kumo-Tabular-Small_c1_BAG_L1",
+    **_kumo_run_kwargs,
+)
+
 beyond_method_metadata_lst: list[MethodMetadata] = [
     beyond_linear_2026_09_metadata,
     beyond_random_forest_metadata,
@@ -217,7 +266,7 @@ beyond_method_metadata_lst: list[MethodMetadata] = [
     beyond_lightgbm_metadata,
     beyond_xgboost_metadata,
     beyond_realmlp_metadata,
-    beyond_tabm_metadata,
+    beyond_tabm_2026_10_metadata,
     beyond_tabdpt_metadata,
     beyond_tabpfnv26_metadata,
     beyond_tabiclv2_metadata,
@@ -231,6 +280,9 @@ beyond_method_metadata_lst: list[MethodMetadata] = [
     beyond_realtabpfnv25_metadata,
     beyond_tabdpt13_metadata,
     beyond_tabswift_metadata,
+    beyond_kumo_tabular_metadata,
+    beyond_kumo_tabular_medium_metadata,
+    beyond_kumo_tabular_small_metadata,
 ]
 
 beyond_method_metadata_collection = MethodMetadataCollection(
@@ -241,9 +293,40 @@ beyond_method_metadata_collection = MethodMetadataCollection(
 # by (method, suite) through the complete collection. Append a method here whenever a rerun takes over its slot.
 beyond_methods_superseded: list[MethodMetadata] = [
     beyond_linear_metadata,  # rerun beyondarena-2026-09-24 replaced it
+    beyond_tabm_metadata,  # the merged suite beyondarena-2026-10-28 replaced it
+    beyond_tabm_2026_10_rerun_metadata,  # the rerun alone (14 datasets, with raw), merged into beyondarena-2026-10-28
 ]
 
 # The roster plus every superseded variant: all hosted BeyondArena results.
 beyond_method_metadata_complete_collection = beyond_method_metadata_collection.with_additional_methods(
     beyond_methods_superseded,
+)
+
+# The 11 methods of the BeyondArena paper (arXiv 2606.30410), with the results it published: all from suite
+# ``beyond_iid_benchmark_2026``, including the Linear entry that a rerun later superseded. Evaluated on all
+# splits, it reproduces the paper's leaderboard; see ``examples/reproducibility/``.
+beyond_method_metadata_2026_06_paper_collection = MethodMetadataCollection(
+    method_metadata_lst=[
+        beyond_linear_metadata,
+        beyond_random_forest_metadata,
+        beyond_extra_trees_metadata,
+        beyond_catboost_metadata,
+        beyond_lightgbm_metadata,
+        beyond_xgboost_metadata,
+        beyond_realmlp_metadata,
+        beyond_tabm_metadata,
+        beyond_tabdpt_metadata,
+        beyond_tabpfnv26_metadata,
+        beyond_tabiclv2_metadata,
+    ],
+)
+
+# The paper's 11 methods for its camera-ready version: as ``beyond_method_metadata_2026_06_paper_collection``, with
+# TabM's fixed results (``beyondarena-2026-10-28``). Linear stays the published one, since its rerun covers only the
+# core and core2k splits.
+beyond_method_metadata_2026_camera_ready_collection = MethodMetadataCollection(
+    method_metadata_lst=[
+        beyond_tabm_2026_10_metadata if m is beyond_tabm_metadata else m
+        for m in beyond_method_metadata_2026_06_paper_collection.method_metadata_lst
+    ],
 )
