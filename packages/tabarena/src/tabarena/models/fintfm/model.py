@@ -115,9 +115,13 @@ class FinTFMModel(AbstractTorchModel):
     #: ``FINTFM_ALLOW_MULTICLASS=1`` adds multiclass for a local measurement run (fintfm
     #: DR7.4), with the checkpoint from ``FINTFM_CHECKPOINT_MULTICLASS``. It is read once, at
     #: import, so it must be set before the process starts; unset, the declaration is the
-    #: submitted one.
+    #: submitted one. ``FINTFM_ALLOW_REGRESSION=1`` adds regression the same way, with the
+    #: checkpoint from ``FINTFM_CHECKPOINT_REGRESSION`` (fintfm DR7.5, coverage of all 51
+    #: datasets).
     _supported_problem_types: ClassVar[list[str]] = (
-        ["binary", "multiclass"] if os.environ.get("FINTFM_ALLOW_MULTICLASS") == "1" else ["binary"]
+        ["binary"]
+        + (["multiclass"] if os.environ.get("FINTFM_ALLOW_MULTICLASS") == "1" else [])
+        + (["regression"] if os.environ.get("FINTFM_ALLOW_REGRESSION") == "1" else [])
     )
 
     #: Not a CUDA-only model: it runs on CPU, MPS and CUDA, and the reference machine has no
@@ -364,11 +368,14 @@ class FinTFMModel(AbstractTorchModel):
         from fintfm.inference.regressor import FinancialTFMRegressor
 
         n_features = X.shape[1]
-        if n_features > network.cfg.max_features:
+        if n_features > network.cfg.max_features and params.get("max_features_strategy", "raise") != "select":
+            # "select" ranks the columns against the bin indices on the training rows and is
+            # an ordinary narrower table from then on; "subsample" averages member
+            # probabilities over column subsets and is left to classification.
             raise AssertionError(
                 f"fintfm checkpoint accepts at most {network.cfg.max_features} features, "
                 f"task has {n_features}. Truncating would score a different task, so this "
-                f"raises instead."
+                f"raises instead. Pass max_features_strategy='select' to score it."
             )
         bins = min(n_bins, network.cfg.max_classes)
         if bins < n_bins:

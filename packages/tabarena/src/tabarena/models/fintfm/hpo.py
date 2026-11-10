@@ -9,9 +9,9 @@ from tabarena.utils.config_utils import ConfigGenerator
 #: every key here is a ``FinancialTFMClassifier`` argument; there is no softmax temperature or
 #: other option the classifier lacks. None of these levers has been measured on TabArena yet,
 #: and the per-member ones (``ensemble_transforms``, ``ensemble_svd_components``,
-#: ``ensemble_class_shift``, ``max_features_strategy``) need a fintfm build from source at or
-#: after commit b3da945; the pinned ``fintfm==0.5.5`` extra predates them. The default config
-#: (``manual_configs=[{}]``) uses none of them and runs on 0.5.5 unchanged.
+#: ``ensemble_class_shift``, ``max_features_strategy``) need fintfm 0.8.0 or later; the pinned
+#: ``fintfm==0.9.0`` extra has all of them, and the partitioned contexts and probe per leaf
+#: (fintfm FINDINGS §215) too. The default config (``manual_configs=[{}]``) uses none of them.
 #:
 #: Cost scales linearly with ``n_ensemble`` (doubled again by ``ensemble_label_swap``) and with
 #: the square of ``max_context``, so a tuned run is GPU work (fintfm audit AU5.13 records about

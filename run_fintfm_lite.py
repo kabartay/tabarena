@@ -9,6 +9,7 @@ easier benchmark than the one everyone else ran.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -39,14 +40,19 @@ def eligible_datasets() -> list[str]:
     from tabarena.models.fintfm.model import FinTFMModel
 
     kinds = tuple(FinTFMModel._supported_problem_types)
+    # A table wider than the checkpoint runs when FINTFM_PARAMS names a column strategy the
+    # adapter accepts for its problem type: "select" for any, "subsample" for classification.
+    strategy = json.loads(os.environ.get("FINTFM_PARAMS") or "{}").get("max_features_strategy")
+    wide_ok = (strategy == "select") | ((strategy == "subsample") & (tm["problem_type"] != "regression"))
+    fits_width = (tm["n_features"] <= 136) | wide_ok
     ok = tm[
         tm["problem_type"].isin(kinds)
-        & (tm["n_features"] <= 136)
+        & fits_width
         & ((tm["problem_type"] != "multiclass") | (tm["n_classes"].fillna(2) <= 10))
     ]
     excluded = {
         "problem type not declared by the model": (~tm["problem_type"].isin(kinds)).sum(),
-        "over 136 features": (tm["problem_type"].isin(kinds) & (tm["n_features"] > 136)).sum(),
+        "over 136 features": (tm["problem_type"].isin(kinds) & ~fits_width).sum(),
         "over 10 classes": ((tm["problem_type"] == "multiclass") & (tm["n_classes"].fillna(2) > 10)).sum(),
     }
     print(f"coverage: {len(ok)} of {len(tm)} datasets ({len(ok) / len(tm):.0%})")

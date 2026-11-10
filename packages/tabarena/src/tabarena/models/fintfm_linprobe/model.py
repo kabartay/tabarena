@@ -73,6 +73,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         # fitted categorical encoder is reused rather than refit on the same rows twice.
         Xp = self._preprocess(X, is_train=False)
         y_arr = np.asarray(y)
+        self._ridge_probe = None
+        if self.problem_type == "regression":
+            self._leaf_probes = None
+            self._linear_probe = None
+            self._fit_ridge_probe(np.asarray(Xp, dtype=np.float32), y_arr.astype(np.float64))
+            return
         if hasattr(self.model, "trees_"):
             # FINTFM_PARTITION wrapped the classifier: one probe per leaf context.
             self._fit_leaf_probes(np.asarray(Xp, dtype=np.float32), y_arr)
@@ -96,6 +102,33 @@ class FinTFMLinearProbeModel(FinTFMModel):
             return
         rep = self.model.transform_representation(Xp[sub], stage="pre_head")
         self._linear_probe = LogisticRegression(max_iter=1000).fit(rep, y_sub)
+
+    def _fit_ridge_probe(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
+        """Fit a ridge readout on the binned regressor's pre-head representation.
+
+        The regression counterpart of the classification probe. ``FinancialTFMRegressor``
+        conditions a classifier on quantile-bin indices of the target; its pre-head
+        representation of a row is read here and a standardised ``RidgeCV`` maps it to the
+        continuous target directly, so the prediction is no longer limited to a weighted
+        average of the bin representatives. Up to ``TRAIN_SAMPLE_SIZE`` training rows, drawn
+        uniformly at random. Partitioned contexts are not applied to regression yet.
+
+        Args:
+            Xp: Preprocessed training features, the rows the regressor was fitted on.
+            y_arr: Continuous training targets.
+        """
+        import numpy as np
+        from sklearn.linear_model import RidgeCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        if self._env_partition() is not None:
+            logger.warning("FinTFM-LinProbe: FINTFM_PARTITION is not applied to regression; global ridge probe only.")
+        n = len(y_arr)
+        rng = np.random.default_rng(int(self.random_seed))
+        sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
+        rep = self.model.classifier_.transform_representation(Xp[sub], stage="pre_head")
+        self._ridge_probe = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 13))).fit(rep, y_arr[sub])
 
     def _fit_leaf_probes(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit one probe per leaf context of a partitioned classifier, plus one global probe.
@@ -187,6 +220,10 @@ class FinTFMLinearProbeModel(FinTFMModel):
     def _predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         import numpy as np
 
+        if getattr(self, "_ridge_probe", None) is not None:
+            # Regression: AutoGluon reads this method's output as the predictions themselves.
+            Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
+            return self._ridge_probe.predict(self.model.classifier_.transform_representation(Xp, stage="pre_head"))
         if getattr(self, "_leaf_probes", None) is not None:
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
             part = self.model
@@ -224,6 +261,9 @@ def _probe_rows(y_arr: np.ndarray, budget: int, seed: int) -> np.ndarray:
     """
     import numpy as np
 
+    classes, counts = np.unique(y_arr, return_counts=True)
+    if len(classes) > 2 or (len(classes) == 2 and set(classes.tolist()) != {0, 1}):
+        return _stratified_rows(y_arr, classes, counts, budget, seed)
     positive = np.where(y_arr == 1)[0]
     negative = np.where(y_arr == 0)[0]
     if len(y_arr) > budget and len(positive) >= budget:
@@ -244,3 +284,38 @@ def _probe_rows(y_arr: np.ndarray, budget: int, seed: int) -> np.ndarray:
             negative = rng.choice(negative, size=n_negative, replace=False)
         return np.concatenate([positive, negative])
     return np.arange(len(y_arr))
+
+
+def _stratified_rows(y_arr: np.ndarray, classes: np.ndarray, counts: np.ndarray, budget: int, seed: int) -> np.ndarray:
+    """Positions for a probe on labels other than {0, 1}: every class kept, smallest first.
+
+    The binary rule in :func:`_probe_rows` reads class 1 as the minority and class 0 as the
+    rest, so on a multiclass ``y`` it would drop every class above 1. Here the budget is
+    water-filled across classes instead: classes are visited from smallest to largest, each
+    taking all its rows or an equal share of what is left, whichever is smaller, so a rare
+    class is kept whole and the largest classes absorb the cut.
+
+    Args:
+        y_arr: Labels of the candidate rows.
+        classes: The distinct labels, from ``np.unique``.
+        counts: Rows per label, aligned with ``classes``.
+        budget: Most rows returned.
+        seed: Seed of the random draw.
+
+    Returns:
+        Sorted positions into ``y_arr``, at most ``budget`` of them, every class present.
+    """
+    import numpy as np
+
+    if len(y_arr) <= budget:
+        return np.arange(len(y_arr))
+    rng = np.random.default_rng(seed)
+    order = np.argsort(counts, kind="stable")
+    remaining = budget
+    picked = []
+    for i, c in enumerate(order):
+        take = min(int(counts[c]), remaining // (len(order) - i))
+        rows = np.flatnonzero(y_arr == classes[c])
+        picked.append(rows if take >= len(rows) else rng.choice(rows, size=take, replace=False))
+        remaining -= take
+    return np.sort(np.concatenate(picked))
