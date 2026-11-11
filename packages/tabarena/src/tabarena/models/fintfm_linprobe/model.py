@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from tabarena.models.fintfm.model import FinTFMModel, prefetch_weights  # noqa: F401 (re-exported to info.py)
@@ -18,6 +20,8 @@ logger = logging.getLogger(__name__)
 TRAIN_SAMPLE_SIZE = 20_000
 #: Fewest probe rows a partition leaf is given, however small its share of the training rows.
 LEAF_MIN_SAMPLE = 2_000
+#: Keys ``FINTFM_PROBE`` accepts; see :meth:`FinTFMLinearProbeModel._probe_options`.
+PROBE_OPTIONS = frozenset({"scale", "cv", "raw"})
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
@@ -57,7 +61,6 @@ class FinTFMLinearProbeModel(FinTFMModel):
         **kwargs,
     ):
         import numpy as np
-        from sklearn.linear_model import LogisticRegression
 
         super()._fit(
             X,
@@ -103,8 +106,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
             )
             self._linear_probe = None
             return
-        rep = self.model.transform_representation(Xp[sub], stage="pre_head")
-        self._linear_probe = LogisticRegression(max_iter=1000).fit(rep, y_sub)
+        Xp = np.asarray(Xp, dtype=np.float32)
+        self._fit_raw_conditioner(Xp)
+        self._linear_probe = self._new_classifier_probe().fit(self._probe_input(self.model, Xp[sub]), y_sub)
 
     def _fit_ridge_probe(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit a ridge readout on the binned regressor's pre-head representation.
@@ -130,8 +134,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         n = len(y_arr)
         rng = np.random.default_rng(int(self.random_seed))
         sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
-        rep = self.model.classifier_.transform_representation(Xp[sub], stage="pre_head")
-        self._ridge_probe = make_pipeline(StandardScaler(), RidgeCV(alphas=np.logspace(-3, 3, 13))).fit(rep, y_arr[sub])
+        self._fit_raw_conditioner(Xp)
+        # A wider grid when raw columns join the representation: a 1,024-column table can need
+        # far more shrinkage than the representation alone.
+        alphas = np.logspace(-3, 5, 17) if self._probe_options().get("raw") else np.logspace(-3, 3, 13)
+        rep = self._probe_input(self.model.classifier_, Xp[sub])
+        self._ridge_probe = make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
 
     def _fit_leaf_probes(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit one probe per leaf context of a partitioned classifier, plus one global probe.
@@ -154,6 +162,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         part = self.model
         n = len(y_arr)
         seed = int(self.random_seed)
+        self._fit_raw_conditioner(Xp)
         self._linear_probe = self._fit_probe(part.global_estimator_, Xp, y_arr, np.arange(n), TRAIN_SAMPLE_SIZE, seed)
         routes = part.route(Xp)
         self._leaf_probes = []
@@ -193,14 +202,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
             the caller then scores with ``est``'s own head.
         """
         import numpy as np
-        from sklearn.linear_model import LogisticRegression
 
         sub = members[_probe_rows(y_arr[members], budget, seed)]
         y_sub = y_arr[sub]
         if len(np.unique(y_sub)) < len(np.unique(y_arr)):
             return None
-        rep = est.transform_representation(Xp[sub], stage="pre_head")
-        return LogisticRegression(max_iter=1000).fit(rep, y_sub)
+        return self._new_classifier_probe().fit(self._probe_input(est, Xp[sub]), y_sub)
 
     def _score(self, est, probe, X: np.ndarray) -> np.ndarray:
         """Class probabilities for ``X`` from ``probe`` on ``est``'s representation, or ``est``'s head.
@@ -218,7 +225,93 @@ class FinTFMLinearProbeModel(FinTFMModel):
             # The head scores the labels it was fitted on, flipped when FINTFM_MINORITY_POSITIVE
             # flipped them; the probes always see the original labels.
             return proba[:, ::-1] if getattr(self, "_minority_flipped", False) else proba
-        return probe.predict_proba(est.transform_representation(X, stage="pre_head"))
+        return probe.predict_proba(self._probe_input(est, X))
+
+    @staticmethod
+    def _probe_options() -> dict:
+        """Readout options from ``FINTFM_PROBE``, a JSON object; empty when unset.
+
+        Unset, every readout is exactly the one the earlier runs used: a ``LogisticRegression``
+        at ``C=1`` on the raw representation, and a standardised ``RidgeCV`` for regression.
+        The keys, each a boolean:
+
+        - ``scale``: standardise the probe's inputs before the logistic regression.
+        - ``cv``: choose the logistic regression's ``C`` by 3-fold cross-validated log loss on
+          the probe rows, instead of the fixed ``C=1``.
+        - ``raw``: append the row's own features to the representation, squashed (median, IQR
+          and soft clip, fitted on the training rows) with missing values at the median. The
+          readout can then reach a linear model of the features as well as the network's
+          representation of them. Applies to the ridge readout too.
+
+        Like ``FINTFM_PARAMS``, the options do not change the config name, so a run that sets
+        them needs its own ``FINTFM_RUN_NAME``.
+
+        Returns:
+            The parsed options.
+
+        Raises:
+            ValueError: the value is not a JSON object, or names an unknown key.
+        """
+        raw = os.environ.get("FINTFM_PROBE", "").strip()
+        if not raw:
+            return {}
+        opts = json.loads(raw)
+        if not isinstance(opts, dict):
+            raise ValueError(f"FINTFM_PROBE must be a JSON object, got {raw!r}")
+        unknown = set(opts) - PROBE_OPTIONS
+        if unknown:
+            raise ValueError(f"FINTFM_PROBE has unknown key(s) {sorted(unknown)}; known: {sorted(PROBE_OPTIONS)}")
+        return opts
+
+    def _new_classifier_probe(self):
+        """An unfitted classification readout, as :meth:`_probe_options` configures it.
+
+        Returns:
+            A scikit-learn classifier with ``fit`` and ``predict_proba``.
+        """
+        import numpy as np
+        from sklearn.linear_model import LogisticRegression, LogisticRegressionCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        opts = self._probe_options()
+        if opts.get("cv"):
+            probe = LogisticRegressionCV(Cs=np.logspace(-3, 2, 6), cv=3, scoring="neg_log_loss", max_iter=2000)
+        else:
+            probe = LogisticRegression(max_iter=1000)
+        return make_pipeline(StandardScaler(), probe) if opts.get("scale") else probe
+
+    def _fit_raw_conditioner(self, Xp: np.ndarray) -> None:
+        """Fit the squash applied to the raw features the ``raw`` option appends, if set.
+
+        Args:
+            Xp: Preprocessed training features, all training rows.
+        """
+        from fintfm.inference.preprocess import FeatureConditioner
+
+        self._raw_conditioner = None
+        if self._probe_options().get("raw"):
+            self._raw_conditioner = FeatureConditioner("squash", random_state=int(self.random_seed)).fit(Xp)
+
+    def _probe_input(self, est, X: np.ndarray) -> np.ndarray:
+        """The readout's input for rows ``X``: ``est``'s pre-head representation, plus raw features.
+
+        Args:
+            est: The fitted network whose context conditions the representation.
+            X: Preprocessed rows.
+
+        Returns:
+            ``(n, d)`` representation, or ``(n, d + F)`` with the squashed features appended
+            when the ``raw`` option is set.
+        """
+        import numpy as np
+
+        rep = est.transform_representation(X, stage="pre_head")
+        cond = getattr(self, "_raw_conditioner", None)
+        if cond is None:
+            return rep
+        z = np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0)
+        return np.hstack([np.asarray(rep, dtype=np.float64), z.astype(np.float64)])
 
     def _predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         import numpy as np
@@ -226,7 +319,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if getattr(self, "_ridge_probe", None) is not None:
             # Regression: AutoGluon reads this method's output as the predictions themselves.
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
-            return self._ridge_probe.predict(self.model.classifier_.transform_representation(Xp, stage="pre_head"))
+            return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
         if getattr(self, "_leaf_probes", None) is not None:
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
             part = self.model
@@ -245,9 +338,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
             # frame, since super()._predict_proba does its own preprocess call and would
             # double-preprocess an already-converted array otherwise.
             return super()._predict_proba(X, **kwargs)
-        X = self.preprocess(X, **kwargs)
-        rep = self.model.transform_representation(X, stage="pre_head")
-        proba = self._linear_probe.predict_proba(rep)
+        X = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
+        proba = self._linear_probe.predict_proba(self._probe_input(self.model, X))
         return self._convert_proba_to_unified_form(proba)
 
 
