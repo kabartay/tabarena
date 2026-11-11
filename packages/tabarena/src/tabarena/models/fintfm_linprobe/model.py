@@ -70,8 +70,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
             **kwargs,
         )
         # The same preprocessing _fit just used, replayed with is_train=False so the already-
-        # fitted categorical encoder is reused rather than refit on the same rows twice.
-        Xp = self._preprocess(X, is_train=False)
+        # fitted categorical encoder is reused rather than refit on the same rows twice. The
+        # public preprocess, as at predict time: it first drops the columns AutoGluon removed
+        # for this model, which the private _preprocess alone keeps, and the fitted classifier
+        # then refuses the wider table (Bioresponse on TabArena-Lite, 2026-11-11).
+        Xp = self.preprocess(X, is_train=False)
         y_arr = np.asarray(y)
         self._ridge_probe = None
         if self.problem_type == "regression":
