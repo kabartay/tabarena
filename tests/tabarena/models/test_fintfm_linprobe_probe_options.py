@@ -35,6 +35,17 @@ class _Network:
         """
         return np.column_stack([X[:, 0], np.ones(len(X))])
 
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Return a uniform three-class distribution, the head's stand-in output.
+
+        Args:
+            X: Query rows.
+
+        Returns:
+            ``(n, 3)`` probabilities.
+        """
+        return np.full((len(X), 3), 1.0 / 3.0)
+
 
 def _fitted(monkeypatch: pytest.MonkeyPatch, probe: str | None) -> FinTFMLinearProbeModel:
     """A probe model fitted on three features with the parent fit stubbed and ``FINTFM_PROBE`` set."""
@@ -75,6 +86,12 @@ def test_raw_appends_the_features_and_scale_wraps_a_scaler(monkeypatch: pytest.M
     X[0, 2] = np.nan
     proba = model._linear_probe.predict_proba(model._probe_input(model.model, X))
     assert np.isfinite(proba).all()
+
+
+def test_head_appends_the_head_log_probabilities(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``head`` widens the probe's input by one column per class."""
+    model = _fitted(monkeypatch, '{"scale": true, "head": true}')
+    assert model._linear_probe.n_features_in_ == 5
 
 
 def test_unknown_key_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:

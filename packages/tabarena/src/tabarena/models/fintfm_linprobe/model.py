@@ -21,7 +21,7 @@ TRAIN_SAMPLE_SIZE = 20_000
 #: Fewest probe rows a partition leaf is given, however small its share of the training rows.
 LEAF_MIN_SAMPLE = 2_000
 #: Keys ``FINTFM_PROBE`` accepts; see :meth:`FinTFMLinearProbeModel._probe_options`.
-PROBE_OPTIONS = frozenset({"scale", "cv", "raw"})
+PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head"})
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
@@ -242,6 +242,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
           and soft clip, fitted on the training rows) with missing values at the median. The
           readout can then reach a linear model of the features as well as the network's
           representation of them. Applies to the ridge readout too.
+        - ``head``: append the network's own output for the row: the log of its head's class
+          probabilities, or for regression the binned regressor's own prediction. The readout
+          can then keep what the head gets right and correct the rest.
 
         Like ``FINTFM_PARAMS``, the options do not change the config name, so a run that sets
         them needs its own ``FINTFM_RUN_NAME``.
@@ -294,24 +297,29 @@ class FinTFMLinearProbeModel(FinTFMModel):
             self._raw_conditioner = FeatureConditioner("squash", random_state=int(self.random_seed)).fit(Xp)
 
     def _probe_input(self, est, X: np.ndarray) -> np.ndarray:
-        """The readout's input for rows ``X``: ``est``'s pre-head representation, plus raw features.
+        """The readout's input for rows ``X``: ``est``'s pre-head representation, plus options.
 
         Args:
             est: The fitted network whose context conditions the representation.
             X: Preprocessed rows.
 
         Returns:
-            ``(n, d)`` representation, or ``(n, d + F)`` with the squashed features appended
-            when the ``raw`` option is set.
+            ``(n, d)`` representation, widened by the squashed features when the ``raw``
+            option is set and by the network's own output when ``head`` is set.
         """
         import numpy as np
 
         rep = est.transform_representation(X, stage="pre_head")
+        blocks = [np.asarray(rep, dtype=np.float64)]
         cond = getattr(self, "_raw_conditioner", None)
-        if cond is None:
-            return rep
-        z = np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0)
-        return np.hstack([np.asarray(rep, dtype=np.float64), z.astype(np.float64)])
+        if cond is not None:
+            blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
+        if self._probe_options().get("head"):
+            if self.problem_type == "regression":
+                blocks.append(np.asarray(self.model.predict(X), dtype=np.float64).reshape(-1, 1))
+            else:
+                blocks.append(np.log(np.clip(np.asarray(est.predict_proba(X), dtype=np.float64), 1e-6, 1.0)))
+        return blocks[0] if len(blocks) == 1 else np.hstack(blocks)
 
     def _predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
         import numpy as np
