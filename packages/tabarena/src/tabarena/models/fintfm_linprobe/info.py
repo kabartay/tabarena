@@ -26,6 +26,6 @@ fintfm_linprobe_info = ModelInfo(
     model_cls=FinTFMLinearProbeModel,
     search_space=gen_fintfm_linprobe,
     method_metadata=fintfm_linprobe_method_metadata,
-    pip_extra=("fintfm==0.9.0",),
+    pip_extra=("fintfm==0.10.0",),
     prefetch_weights=prefetch_weights,
 )
