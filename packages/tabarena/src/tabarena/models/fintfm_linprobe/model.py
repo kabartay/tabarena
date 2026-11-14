@@ -244,14 +244,16 @@ class FinTFMLinearProbeModel(FinTFMModel):
             seed: Seed of that draw.
 
         Returns:
-            The fitted probe, or ``None`` when the draw misses a class present in ``y_arr``;
-            the caller then scores with ``est``'s own head.
+            The fitted probe, or ``None`` when the draw misses a class present among
+            ``members``; the caller then scores with ``est``'s own head. A leaf fitted under
+            ``missing_classes="global"`` can hold fewer classes than the table; its probe
+            covers the leaf's classes and the caller widens it with the global probe.
         """
         import numpy as np
 
         sub = members[_probe_rows(y_arr[members], budget, seed)]
         y_sub = y_arr[sub]
-        if len(np.unique(y_sub)) < len(np.unique(y_arr)):
+        if len(np.unique(y_sub)) < len(np.unique(y_arr[members])):
             return None
         return self._new_classifier_probe().fit(self._probe_input(est, Xp[sub]), y_sub)
 
@@ -397,7 +399,14 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     est, probe = leaves.get(int(leaf)), self._leaf_probes[b].get(int(leaf))
                     if est is None:
                         est, probe = part.global_estimator_, self._linear_probe
-                    out[rows] += self._score(est, probe, Xp[rows])
+                    proba = self._score(est, probe, Xp[rows])
+                    if proba.shape[1] < len(part.classes_):
+                        # A leaf lacking some classes (missing_classes="global"): the global
+                        # probe supplies their probability, the leaf's probe shares the rest.
+                        classes = probe.classes_ if probe is not None else est.classes_
+                        glob = self._score(part.global_estimator_, self._linear_probe, Xp[rows])
+                        proba = part.combine_with_global(proba, classes, glob)
+                    out[rows] += proba
             return self._convert_proba_to_unified_form(out / len(part.leaf_estimators_))
         if self._linear_probe is None:
             # Fell back to the network's own head at fit time; delegate to it on the raw

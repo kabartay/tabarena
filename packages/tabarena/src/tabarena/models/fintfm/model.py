@@ -390,8 +390,13 @@ class FinTFMModel(AbstractTorchModel):
         partition = self._env_partition()
         if partition is not None:
             # A regression tree on the target; each leaf bins its own targets (fintfm 49.1).
+            import inspect
+
             from fintfm.inference.large_n import PartitionedTFMRegressor
 
+            # missing_classes is a classification setting; the regressor has no classes.
+            accepted = set(inspect.signature(PartitionedTFMRegressor.__init__).parameters)
+            partition = {k: v for k, v in partition.items() if k in accepted}
             regressor = PartitionedTFMRegressor(regressor, random_state=params["random_state"], **partition)
         self.model = regressor.fit(X, y)
 
