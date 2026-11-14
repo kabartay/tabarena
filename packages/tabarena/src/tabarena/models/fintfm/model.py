@@ -391,7 +391,7 @@ class FinTFMModel(AbstractTorchModel):
         thresholds = os.environ.get("FINTFM_REG_THRESHOLDS", "").strip()
         if thresholds:
             # K binary classifiers on y > t_k instead of one classifier over max_classes bins
-            # (fintfm ThresholdTFMRegressor, FINDINGS §234): the grid is K, not the head's cap.
+            # (fintfm ThresholdTFMRegressor, FINDINGS §235): the grid is K, not the head's cap.
             from fintfm.inference.threshold_regressor import ThresholdTFMRegressor
 
             if partition is not None:
