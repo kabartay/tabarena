@@ -149,6 +149,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     probes[leaf] = None
                     continue
                 members = np.flatnonzero(routes[b] == leaf)
+                if members.size == 0:
+                    # No training row routes here once the replayed preprocessing re-encodes
+                    # the categoricals; the leaf then predicts through the global readout.
+                    probes[leaf] = None
+                    continue
                 budget = max(LEAF_MIN_SAMPLE, round(TRAIN_SAMPLE_SIZE * len(members) / n))
                 probes[leaf] = self._fit_ridge(est.classifier_, Xp, y_arr, members, budget, seed + 1 + b * 1000 + leaf)
             self._ridge_leaf_probes.append(probes)
@@ -244,13 +249,20 @@ class FinTFMLinearProbeModel(FinTFMModel):
             seed: Seed of that draw.
 
         Returns:
-            The fitted probe, or ``None`` when the draw misses a class present among
-            ``members``; the caller then scores with ``est``'s own head. A leaf fitted under
+            The fitted probe, or ``None`` when no training row routes to the leaf or the draw
+            misses a class present among ``members``; the caller then scores with ``est``'s own
+            head. A leaf fitted under
             ``missing_classes="global"`` can hold fewer classes than the table; its probe
             covers the leaf's classes and the caller widens it with the global probe.
         """
         import numpy as np
 
+        if members.size == 0:
+            # A leaf context to which none of the replayed training rows routes: the replay
+            # (preprocess with is_train=False) can encode categoricals differently from the
+            # fit, so the tree sends them elsewhere (HR_Analytics, 2026-11-14). The caller
+            # scores such a leaf with its own head, as when the draw misses a class.
+            return None
         sub = members[_probe_rows(y_arr[members], budget, seed)]
         y_sub = y_arr[sub]
         if len(np.unique(y_sub)) < len(np.unique(y_arr[members])):
@@ -384,7 +396,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 for leaf in np.unique(routes[b]):
                     rows = np.flatnonzero(routes[b] == leaf)
                     est, probe = leaves.get(int(leaf)), self._ridge_leaf_probes[b].get(int(leaf))
-                    if est is None:
+                    if est is None or probe is None:
                         est, probe = part.global_estimator_, self._ridge_probe
                     out[rows] += probe.predict(self._probe_input(est.classifier_, Xp[rows]))
             return out / len(part.leaf_estimators_)
