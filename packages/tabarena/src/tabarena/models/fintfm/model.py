@@ -388,6 +388,18 @@ class FinTFMModel(AbstractTorchModel):
         params.setdefault("random_state", self.random_seed)
         regressor = FinancialTFMRegressor(network, n_bins=bins, classifier_params={"device": device, **params})
         partition = self._env_partition()
+        thresholds = os.environ.get("FINTFM_REG_THRESHOLDS", "").strip()
+        if thresholds:
+            # K binary classifiers on y > t_k instead of one classifier over max_classes bins
+            # (fintfm ThresholdTFMRegressor, FINDINGS §234): the grid is K, not the head's cap.
+            from fintfm.inference.threshold_regressor import ThresholdTFMRegressor
+
+            if partition is not None:
+                raise ValueError("FINTFM_REG_THRESHOLDS and FINTFM_PARTITION are not combined yet")
+            regressor = ThresholdTFMRegressor(
+                network, n_thresholds=int(thresholds), classifier_params={"device": device, **params}
+            )
+            logger.warning("fintfm: threshold regression, %s thresholds", thresholds)
         if partition is not None:
             # A regression tree on the target; each leaf bins its own targets (fintfm 49.1).
             import inspect

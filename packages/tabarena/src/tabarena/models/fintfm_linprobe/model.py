@@ -134,6 +134,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         n = len(y_arr)
         seed = int(self.random_seed)
         self._fit_raw_conditioner(Xp)
+        self._ridge_leaf_probes = None
+        if hasattr(self.model, "thresholds_"):
+            # FINTFM_REG_THRESHOLDS: the readout reads the K threshold logits, not a
+            # representation, beside the raw features when the raw option is set.
+            self._ridge_probe = self._fit_threshold_ridge(Xp, y_arr, seed)
+            return
         part = self.model if hasattr(self.model, "trees_") else None
         glob = part.global_estimator_ if part is not None else self.model
         self._ridge_probe = self._fit_ridge(glob.classifier_, Xp, y_arr, np.arange(n), TRAIN_SAMPLE_SIZE, seed)
@@ -163,6 +169,46 @@ class FinTFMLinearProbeModel(FinTFMModel):
             n_leaf,
             len(part.leaf_estimators_),
         )
+
+    def _threshold_input(self, X: np.ndarray) -> np.ndarray:
+        """The threshold regressor's readout input: its K survival logits, plus raw features.
+
+        Args:
+            X: Preprocessed rows.
+
+        Returns:
+            ``(n, K)`` logits, widened by the squashed features when the ``raw`` option is set.
+        """
+        import numpy as np
+
+        blocks = [self.model.readout_features(X)]
+        cond = getattr(self, "_raw_conditioner", None)
+        if cond is not None:
+            blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
+        return blocks[0] if len(blocks) == 1 else np.hstack(blocks)
+
+    def _fit_threshold_ridge(self, Xp: np.ndarray, y_arr: np.ndarray, seed: int):
+        """A standardised ``RidgeCV`` on :meth:`_threshold_input` of up to ``TRAIN_SAMPLE_SIZE`` rows.
+
+        Args:
+            Xp: Preprocessed training features.
+            y_arr: Continuous training targets.
+            seed: Seed of the row draw, the same draw :meth:`_fit_ridge` makes.
+
+        Returns:
+            The fitted pipeline.
+        """
+        import numpy as np
+        from sklearn.linear_model import RidgeCV
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        rng = np.random.default_rng(seed)
+        n = len(y_arr)
+        sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
+        alphas = np.logspace(-3, 5, 17) if self._probe_options().get("raw") else np.logspace(-3, 3, 13)
+        feats = self._threshold_input(Xp[sub])
+        return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(feats, y_arr[sub])
 
     def _fit_ridge(self, clf, Xp: np.ndarray, y_arr: np.ndarray, members: np.ndarray, budget: int, seed: int):
         """A standardised ``RidgeCV`` on ``clf``'s representation of up to ``budget`` of ``members``.
@@ -387,6 +433,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if getattr(self, "_ridge_probe", None) is not None:
             # Regression: AutoGluon reads this method's output as the predictions themselves.
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
+            if hasattr(self.model, "thresholds_"):
+                return self._ridge_probe.predict(self._threshold_input(Xp))
             if getattr(self, "_ridge_leaf_probes", None) is None:
                 return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
             part = self.model
