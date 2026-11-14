@@ -386,7 +386,14 @@ class FinTFMModel(AbstractTorchModel):
                 bins,
             )
         params.setdefault("random_state", self.random_seed)
-        self.model = FinancialTFMRegressor(network, n_bins=bins, device=device, **params).fit(X, y)
+        regressor = FinancialTFMRegressor(network, n_bins=bins, classifier_params={"device": device, **params})
+        partition = self._env_partition()
+        if partition is not None:
+            # A regression tree on the target; each leaf bins its own targets (fintfm 49.1).
+            from fintfm.inference.large_n import PartitionedTFMRegressor
+
+            regressor = PartitionedTFMRegressor(regressor, random_state=params["random_state"], **partition)
+        self.model = regressor.fit(X, y)
 
     @staticmethod
     def _default_max_context() -> int:

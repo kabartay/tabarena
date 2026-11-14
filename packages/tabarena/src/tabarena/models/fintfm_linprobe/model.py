@@ -118,28 +118,74 @@ class FinTFMLinearProbeModel(FinTFMModel):
         representation of a row is read here and a standardised ``RidgeCV`` maps it to the
         continuous target directly, so the prediction is no longer limited to a weighted
         average of the bin representatives. Up to ``TRAIN_SAMPLE_SIZE`` training rows, drawn
-        uniformly at random. Partitioned contexts are not applied to regression yet.
+        uniformly at random.
+
+        Under ``FINTFM_PARTITION`` the model is a ``PartitionedTFMRegressor``: the global
+        fallback regressor gets this probe, and every leaf with its own regressor gets a ridge
+        probe of its own on the training rows routed to it, read through that leaf's
+        classifier, with the row budget split as in :meth:`_fit_leaf_probes`.
 
         Args:
             Xp: Preprocessed training features, the rows the regressor was fitted on.
             y_arr: Continuous training targets.
         """
         import numpy as np
+
+        n = len(y_arr)
+        seed = int(self.random_seed)
+        self._fit_raw_conditioner(Xp)
+        part = self.model if hasattr(self.model, "trees_") else None
+        glob = part.global_estimator_ if part is not None else self.model
+        self._ridge_probe = self._fit_ridge(glob.classifier_, Xp, y_arr, np.arange(n), TRAIN_SAMPLE_SIZE, seed)
+        self._ridge_leaf_probes = None
+        if part is None:
+            return
+        routes = part.route(Xp)
+        self._ridge_leaf_probes = []
+        for b, leaves in enumerate(part.leaf_estimators_):
+            probes = {}
+            for leaf, est in leaves.items():
+                if est is None:
+                    probes[leaf] = None
+                    continue
+                members = np.flatnonzero(routes[b] == leaf)
+                budget = max(LEAF_MIN_SAMPLE, round(TRAIN_SAMPLE_SIZE * len(members) / n))
+                probes[leaf] = self._fit_ridge(est.classifier_, Xp, y_arr, members, budget, seed + 1 + b * 1000 + leaf)
+            self._ridge_leaf_probes.append(probes)
+        n_leaf = sum(p is not None for probes in self._ridge_leaf_probes for p in probes.values())
+        logger.warning(
+            "FinTFM-LinProbe: partitioned regression, %d leaf ridge probe(s) in %d bag(s).",
+            n_leaf,
+            len(part.leaf_estimators_),
+        )
+
+    def _fit_ridge(self, clf, Xp: np.ndarray, y_arr: np.ndarray, members: np.ndarray, budget: int, seed: int):
+        """A standardised ``RidgeCV`` on ``clf``'s representation of up to ``budget`` of ``members``.
+
+        Args:
+            clf: The fitted classifier inside a binned regressor (a leaf's, or the global one).
+            Xp: Preprocessed training features.
+            y_arr: Continuous training targets.
+            members: Indices of the training rows this probe may learn from.
+            budget: Most rows given to the probe, drawn uniformly at random.
+            seed: Seed of that draw.
+
+        Returns:
+            The fitted pipeline.
+        """
+        import numpy as np
         from sklearn.linear_model import RidgeCV
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
 
-        if self._env_partition() is not None:
-            logger.warning("FinTFM-LinProbe: FINTFM_PARTITION is not applied to regression; global ridge probe only.")
-        n = len(y_arr)
-        rng = np.random.default_rng(int(self.random_seed))
-        sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
-        self._fit_raw_conditioner(Xp)
+        rng = np.random.default_rng(seed)
+        m = len(members)
+        sub = members[np.sort(rng.choice(m, size=budget, replace=False))] if m > budget else members
         # A wider grid when raw columns join the representation: a 1,024-column table can need
         # far more shrinkage than the representation alone.
         alphas = np.logspace(-3, 5, 17) if self._probe_options().get("raw") else np.logspace(-3, 3, 13)
-        rep = self._probe_input(self.model.classifier_, Xp[sub])
-        self._ridge_probe = make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
+        rep = self._probe_input(clf, Xp[sub])
+        return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
 
     def _fit_leaf_probes(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit one probe per leaf context of a partitioned classifier, plus one global probe.
@@ -327,7 +373,19 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if getattr(self, "_ridge_probe", None) is not None:
             # Regression: AutoGluon reads this method's output as the predictions themselves.
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
-            return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
+            if getattr(self, "_ridge_leaf_probes", None) is None:
+                return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
+            part = self.model
+            routes = part.route(Xp)
+            out = np.zeros(Xp.shape[0], dtype=np.float64)
+            for b, leaves in enumerate(part.leaf_estimators_):
+                for leaf in np.unique(routes[b]):
+                    rows = np.flatnonzero(routes[b] == leaf)
+                    est, probe = leaves.get(int(leaf)), self._ridge_leaf_probes[b].get(int(leaf))
+                    if est is None:
+                        est, probe = part.global_estimator_, self._ridge_probe
+                    out[rows] += probe.predict(self._probe_input(est.classifier_, Xp[rows]))
+            return out / len(part.leaf_estimators_)
         if getattr(self, "_leaf_probes", None) is not None:
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
             part = self.model
