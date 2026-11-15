@@ -211,7 +211,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._fit_raw_conditioner(Xp)
         # The classifier was fitted on every row, so a row's position in its fit rows is its index.
         fit_idx = sub if crossfit else None
-        self._linear_probe = self._new_classifier_probe().fit(self._probe_input(self.model, Xp[sub], fit_idx), y_sub)
+        self._linear_probe = self._new_classifier_probe(y_sub).fit(
+            self._probe_input(self.model, Xp[sub], fit_idx), y_sub
+        )
         self._log_crossfit()
 
     def _resolve_entry(self, params: dict) -> dict:
@@ -498,7 +500,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if len(np.unique(y_sub)) < len(np.unique(y_arr[members])):
             return None
         fit_idx = None if fit_rows is None else _positions_in(fit_rows, sub)
-        return self._new_classifier_probe().fit(self._probe_input(est, Xp[sub], fit_idx), y_sub)
+        return self._new_classifier_probe(y_sub).fit(self._probe_input(est, Xp[sub], fit_idx), y_sub)
 
     def _all_rows(self, n: int) -> np.ndarray | None:
         """Fit rows of an estimator fitted on all ``n`` rows when cross-fitting, else ``None``."""
@@ -674,8 +676,17 @@ class FinTFMLinearProbeModel(FinTFMModel):
             raise ValueError(f"{source}: no_rep needs raw, the readout would have no input")
         return dict(opts)
 
-    def _new_classifier_probe(self):
-        """An unfitted classification readout, as :meth:`_probe_options` configures it.
+    def _new_classifier_probe(self, y: np.ndarray):
+        """An unfitted classification readout, as :meth:`_validated_probe` configures it.
+
+        With the ``cv`` option the folds are 3, or fewer when the rarest class in ``y`` has
+        fewer than 3 rows (a stratified split needs a row of every class in each fold). With
+        fewer than 2 rows of some class there is nothing to select ``C`` on, so the readout is
+        the fixed ``C=1`` one. On real data, where every class has at least 3 rows, the readout
+        is unchanged.
+
+        Args:
+            y: The labels the readout will be fitted on.
 
         Returns:
             A scikit-learn classifier with ``fit`` and ``predict_proba``.
@@ -686,8 +697,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
         from sklearn.preprocessing import StandardScaler
 
         opts = self._probe_opts
-        if opts.get("cv"):
-            probe = LogisticRegressionCV(Cs=np.logspace(-3, 2, 6), cv=3, scoring="neg_log_loss", max_iter=2000)
+        folds = min(3, int(np.unique(y, return_counts=True)[1].min())) if len(y) else 0
+        if opts.get("cv") and folds >= 2:
+            probe = LogisticRegressionCV(Cs=np.logspace(-3, 2, 6), cv=folds, scoring="neg_log_loss", max_iter=2000)
         else:
             probe = LogisticRegression(max_iter=1000)
         return make_pipeline(StandardScaler(), probe) if opts.get("scale") else probe
