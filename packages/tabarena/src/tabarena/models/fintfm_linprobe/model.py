@@ -34,6 +34,12 @@ PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head", "no_rep"})
 #: (FinTFM-LinProbe, 932 Elo) was produced WITHOUT cross-fitting, so any figure from a run
 #: with this default is a new measurement; see :class:`FinTFMLinearProbeModel`.
 PROBE_CROSSFIT_FOLDS = 5
+#: Deepest tree ``fintfm.inference.large_n.PartitionedTFMClassifier`` and ``PartitionedTFMRegressor``
+#: accept (``max_depth`` is checked to lie in [1, 3]); ``partition_depth_cap`` is clipped to it.
+PARTITION_LIBRARY_MAX_DEPTH = 3
+#: Defaults of ``partition_scale_k`` and ``partition_depth_cap``.
+PARTITION_SCALE_K = 4.0
+PARTITION_DEPTH_CAP = 5
 #: The alpha grid ``reg_ridge_alphas="wide"`` names.
 WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
 
@@ -74,6 +80,27 @@ class FinTFMLinearProbeModel(FinTFMModel):
     option is not cross-fitted and is refused while cross-fitting is on; threshold regression
     (``FINTFM_REG_THRESHOLDS``) is not cross-fitted and keeps the earlier readout with a
     warning.
+
+    **Large-table levers (both off by default; off reproduces the earlier fit exactly).**
+
+    - ``partition_scale_with_n`` (bool): choose the partition depth from the training-row count
+      instead of fixing it. With ``n_eff`` the rows one tree is fitted on (all rows for one bag,
+      ``bag_frac * n`` above one bag), the depth is
+      ``clip(ceil(log2(n_eff / (partition_scale_k * max_context))), base, min(partition_depth_cap, 3))``
+      where ``base`` is the partition's own ``max_depth`` (2 when unset). ``partition_scale_k``
+      defaults to 4 and ``partition_depth_cap`` to 5, but the fintfm partition classes refuse a
+      depth above 3 (8 leaves), so the effective cap is 3 until the library allows more; the
+      log line and ``partition_depth_chosen_`` record the requested and the effective depth.
+      Only the depth changes: the leaf floor (``min_samples_leaf``), bag count and the rest of the
+      partition dict are the caller's. Has no effect without a partition for the problem type.
+      Cost: each extra depth level doubles the leaf contexts, so up to 2x the leaf classifiers
+      (each a context of ``max_context`` rows) and 2x as many leaf probes per bag.
+    - ``probe_budget`` (int or ``"all"``, default 20,000 = ``TRAIN_SAMPLE_SIZE``): the readout's
+      training-row budget, in total and split across leaves in proportion to their rows (at
+      least ``LEAF_MIN_SAMPLE`` per leaf). ``"all"`` uses every training row. Cost: the
+      representation pass over the readout rows is linear in the budget, one pass per leaf
+      classifier (and one more per cross-fit fold), and the representation matrix is held in
+      memory, so 50,000 rows is about 2.5x and ``"all"`` on a 100k-row table about 5x the default.
     """
 
     ag_key = "TA-FINTFM-LINPROBE"
@@ -124,6 +151,15 @@ class FinTFMLinearProbeModel(FinTFMModel):
     _reg_transform_name: str = "none"
     _reg_blend = None
     _reg_alphas = None
+    #: Training rows of the current fit, read by :meth:`_resolve_entry` for the depth scaling.
+    _n_fit_rows: int | None = None
+    #: Large-table levers of the current fit, set by :meth:`_resolve_entry`.
+    _scale_with_n: bool = False
+    _scale_k: float = PARTITION_SCALE_K
+    _depth_cap: int = PARTITION_DEPTH_CAP
+    _probe_budget_setting: int | str = TRAIN_SAMPLE_SIZE
+    #: What the depth scaling chose for the current fit (``None`` when off or unpartitioned).
+    partition_depth_chosen_: dict | None = None
     #: The fitted target transform, or ``None`` when none is applied.
     _target_tf: TargetTransform | None = None
     #: What the transform did: requested name, effective name, and the reason for a fallback.
@@ -141,6 +177,10 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("reg_target_transform", "none")
         self._set_default_param_value("reg_readout_blend", None)
         self._set_default_param_value("reg_ridge_alphas", None)
+        self._set_default_param_value("partition_scale_with_n", False)
+        self._set_default_param_value("partition_scale_k", PARTITION_SCALE_K)
+        self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
+        self._set_default_param_value("probe_budget", TRAIN_SAMPLE_SIZE)
 
     @classmethod
     def _env_entry_overrides(cls) -> dict:
@@ -151,6 +191,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
           the ridge); ``none`` or ``off`` leaves it off.
         - ``FINTFM_REG_ALPHAS``: ``reg_ridge_alphas``, a JSON list of positive numbers, ``wide``, or
           ``logspace:lo,hi,n`` (exponents of 10).
+        - ``FINTFM_PARTITION_SCALE_N``: ``partition_scale_with_n``; ``on``/``true`` enables with the default k,
+          ``off``/``false`` disables, a positive number enables and sets ``partition_scale_k``.
+        - ``FINTFM_PROBE_BUDGET``: ``probe_budget``, a positive integer or ``all``.
 
         Returns:
             The overrides; empty when no variable is set.
@@ -185,7 +228,119 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     raise ValueError(f"FINTFM_REG_ALPHAS is not valid JSON: {exc}") from exc
             over["reg_ridge_alphas"] = cls._check_reg_alphas(value, source="FINTFM_REG_ALPHAS")
             logger.warning("fintfm: regression ridge alphas set by FINTFM_REG_ALPHAS")
+        scale = os.environ.get("FINTFM_PARTITION_SCALE_N", "").strip().lower()
+        if scale:
+            if scale in ("on", "true", "yes"):
+                over["partition_scale_with_n"] = True
+            elif scale in ("off", "false", "no"):
+                over["partition_scale_with_n"] = False
+            else:
+                try:
+                    k = float(scale)
+                except ValueError:
+                    raise ValueError(
+                        f"FINTFM_PARTITION_SCALE_N must be on, off or a positive number, got {scale!r}"
+                    ) from None
+                over["partition_scale_with_n"] = True
+                over["partition_scale_k"] = cls._check_scale_k(k, source="FINTFM_PARTITION_SCALE_N")
+            logger.warning("fintfm: partition depth scaling %s (FINTFM_PARTITION_SCALE_N)", scale)
+        budget = os.environ.get("FINTFM_PROBE_BUDGET", "").strip().lower()
+        if budget:
+            value = budget if budget == "all" else cls._int_or_raise(budget, "FINTFM_PROBE_BUDGET")
+            over["probe_budget"] = cls._check_probe_budget(value, source="FINTFM_PROBE_BUDGET")
+            logger.warning("fintfm: probe budget %s (FINTFM_PROBE_BUDGET)", budget)
         return over
+
+    @staticmethod
+    def _int_or_raise(text: str, name: str) -> int:
+        try:
+            return int(text)
+        except ValueError:
+            raise ValueError(f"{name} must be a positive integer or 'all', got {text!r}") from None
+
+    @staticmethod
+    def _check_scale_k(value, *, source: str) -> float:
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{source} must be a positive number, got {value!r}")
+        return float(value)
+
+    @staticmethod
+    def _check_probe_budget(value, *, source: str):
+        if value == "all":
+            return "all"
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{source} must be a positive integer or 'all', got {value!r}")
+        return value
+
+    def _parse_scale_levers(self, params: dict) -> None:
+        """Validate ``partition_scale_*``, ``partition_depth_cap`` and ``probe_budget``, popping them.
+
+        Raises:
+            ValueError: a lever is malformed.
+        """
+        on = params.pop("partition_scale_with_n", False)
+        if not isinstance(on, bool):
+            raise ValueError(f"partition_scale_with_n must be a bool, got {on!r}")
+        self._scale_with_n = on
+        self._scale_k = self._check_scale_k(
+            params.pop("partition_scale_k", PARTITION_SCALE_K), source="partition_scale_k"
+        )
+        cap = params.pop("partition_depth_cap", PARTITION_DEPTH_CAP)
+        if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+            raise ValueError(f"partition_depth_cap must be a positive integer, got {cap!r}")
+        self._depth_cap = cap
+        self._probe_budget_setting = self._check_probe_budget(
+            params.pop("probe_budget", TRAIN_SAMPLE_SIZE), source="probe_budget"
+        )
+
+    def _probe_budget(self, n: int) -> int:
+        """Readout training-row budget for ``n`` candidate rows: ``probe_budget``, or ``n`` for ``"all"``."""
+        return max(1, n) if self._probe_budget_setting == "all" else int(self._probe_budget_setting)
+
+    def _scaled_partition(self, partition: dict | None) -> dict | None:
+        """``partition`` with ``max_depth`` chosen from the training-row count, when scaling is on.
+
+        Args:
+            partition: The validated partition dict, or ``None``.
+
+        Returns:
+            A copy with ``max_depth`` set, or ``partition`` itself when scaling is off, there is
+            no partition, or the row count is not known.
+        """
+        self.partition_depth_chosen_ = None
+        n = self._n_fit_rows
+        if not self._scale_with_n or partition is None or not n:
+            return partition
+        base = int(partition.get("max_depth", 2))
+        n_bags = int(partition.get("n_bags", 1))
+        n_eff = n if n_bags <= 1 else max(1, round(float(partition.get("bag_frac", 0.6)) * n))
+        max_context = int(self._get_model_params().get("max_context", 1000))
+        target = n_eff / (self._scale_k * max_context)
+        wanted = math.ceil(math.log2(target)) if target > 1 else 0
+        cap = min(self._depth_cap, PARTITION_LIBRARY_MAX_DEPTH)
+        depth = max(base, min(wanted, cap))
+        self.partition_depth_chosen_ = {
+            "n_rows": n,
+            "n_effective": n_eff,
+            "base": base,
+            "wanted": max(base, min(wanted, self._depth_cap)),
+            "chosen": depth,
+            "cap_requested": self._depth_cap,
+            "cap_effective": cap,
+        }
+        logger.warning(
+            "FinTFM-LinProbe: partition depth %d for n=%d (n_eff=%d, k=%g, max_context=%d, base %d, "
+            "cap %d requested, %d effective).",
+            depth,
+            n,
+            n_eff,
+            self._scale_k,
+            max_context,
+            base,
+            self._depth_cap,
+            cap,
+        )
+        return {**partition, "max_depth": depth}
 
     @staticmethod
     def _float_or_raise(text: str, name: str) -> float:
@@ -269,6 +424,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         import numpy as np
 
         self._parse_reg_levers(dict(self._get_model_params()), pop=False)
+        self._n_fit_rows = len(X)
         y = self._apply_target_transform(y)
         super()._fit(
             X,
@@ -327,7 +483,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             return
         self._leaf_probes = None
 
-        sub = _probe_rows(y_arr, TRAIN_SAMPLE_SIZE, int(self.random_seed))
+        sub = _probe_rows(y_arr, self._probe_budget(len(y_arr)), int(self.random_seed))
         y_sub = y_arr[sub]
         if len(np.unique(y_sub)) < 2:
             # A linear probe cannot be fit on one class, so fall back to the network's own head
@@ -361,10 +517,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 with the ``head`` probe option, which is not cross-fitted.
         """
         self._parse_reg_levers(params, pop=True)
+        self._parse_scale_levers(params)
         folds = params.pop("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
         if isinstance(folds, bool) or not isinstance(folds, int) or folds < 0:
             raise ValueError(f"probe_crossfit_folds must be a non-negative integer, got {folds!r}")
         entry = super()._resolve_entry(params)
+        entry["partition"] = self._scaled_partition(entry["partition"])
         self._probe_opts = entry["probe"] = self._validated_probe(entry["probe"], source=f"probe_{self.problem_type}")
         if folds >= 2 and self._probe_opts.get("head"):
             raise ValueError(
@@ -526,7 +684,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         conditions a classifier on quantile-bin indices of the target; its pre-head
         representation of a row is read here and a standardised ``RidgeCV`` maps it to the
         continuous target directly, so the prediction is no longer limited to a weighted
-        average of the bin representatives. Up to ``TRAIN_SAMPLE_SIZE`` training rows, drawn
+        average of the bin representatives. Up to ``probe_budget`` training rows, drawn
         uniformly at random.
 
         With a partition the model is a ``PartitionedTFMRegressor``: the global
@@ -556,7 +714,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             Xp,
             y_arr,
             np.arange(n),
-            TRAIN_SAMPLE_SIZE,
+            self._probe_budget(n),
             seed,
             fit_rows=self._all_rows(n),
             binner=getattr(glob, "binner_", None),
@@ -578,7 +736,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     # the categoricals; the leaf then predicts through the global readout.
                     probes[leaf] = None
                     continue
-                budget = max(LEAF_MIN_SAMPLE, round(TRAIN_SAMPLE_SIZE * len(members) / n))
+                budget = max(LEAF_MIN_SAMPLE, round(self._probe_budget(n) * len(members) / n))
                 probes[leaf] = self._fit_ridge(
                     est.classifier_,
                     Xp,
@@ -615,7 +773,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         return blocks[0] if len(blocks) == 1 else np.hstack(blocks)
 
     def _fit_threshold_ridge(self, Xp: np.ndarray, y_arr: np.ndarray, seed: int):
-        """A standardised ``RidgeCV`` on :meth:`_threshold_input` of up to ``TRAIN_SAMPLE_SIZE`` rows.
+        """A standardised ``RidgeCV`` on :meth:`_threshold_input` of up to ``probe_budget`` rows.
 
         Args:
             Xp: Preprocessed training features.
@@ -632,7 +790,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
 
         rng = np.random.default_rng(seed)
         n = len(y_arr)
-        sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
+        budget = self._probe_budget(n)
+        sub = np.sort(rng.choice(n, size=budget, replace=False)) if n > budget else np.arange(n)
         alphas = self._alpha_grid()
         feats = self._threshold_input(Xp[sub])
         return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(feats, y_arr[sub])
@@ -705,7 +864,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         seed = int(self.random_seed)
         self._fit_raw_conditioner(Xp)
         self._linear_probe = self._fit_probe(
-            part.global_estimator_, Xp, y_arr, np.arange(n), TRAIN_SAMPLE_SIZE, seed, fit_rows=self._all_rows(n)
+            part.global_estimator_, Xp, y_arr, np.arange(n), self._probe_budget(n), seed, fit_rows=self._all_rows(n)
         )
         routes = part.route(Xp)
         self._leaf_probes = []
@@ -716,7 +875,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     probes[leaf] = None
                     continue
                 members = np.flatnonzero(routes[b] == leaf)
-                budget = max(LEAF_MIN_SAMPLE, round(TRAIN_SAMPLE_SIZE * len(members) / n))
+                budget = max(LEAF_MIN_SAMPLE, round(self._probe_budget(n) * len(members) / n))
                 probes[leaf] = self._fit_probe(
                     est,
                     Xp,
