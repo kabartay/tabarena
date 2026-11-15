@@ -24,6 +24,8 @@ fintfm_method_metadata = MethodMetadata.config(
     reference_url="https://github.com/kabartay/fintfm",
     license="Apache-2.0",
     commercial_use=True,
+    #: Not signed off by the TabArena maintainers (no merged submission), so no verified mark.
+    verified=False,
 )
 
 fintfm_info = ModelInfo(

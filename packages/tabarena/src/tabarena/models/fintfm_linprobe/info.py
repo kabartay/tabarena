@@ -7,12 +7,14 @@ from tabarena.models.fintfm_linprobe.model import FinTFMLinearProbeModel, prefet
 
 fintfm_linprobe_method_metadata = MethodMetadata.config(
     method="FinTFM-LinProbe",
-    display_name="FinTFM-LinProbe",
+    display_name="FinTFM with a trained linear readout",
     #: Distinct from ``TA-FINTFM`` so this exploratory variant's results never share a cache
     #: entry, a config-name collision, or a leaderboard row with the real entrant.
     ag_key="TA-FINTFM-LINPROBE",
     model_key="FINTFM-LINPROBE",
     config_default="FinTFM-LinProbe_c1_default_BAG_L1",
+    #: The raw results hold only the default config. ``hpo.py`` holds a proposed space that has
+    #: not been run; set this to ``True`` once a run with sampled configs is registered.
     can_hpo=False,
     compute="cpu",
     is_bag=True,
@@ -20,6 +22,9 @@ fintfm_linprobe_method_metadata = MethodMetadata.config(
     reference_url="https://github.com/kabartay/fintfm",
     license="Apache-2.0",
     commercial_use=True,
+    #: Not signed off by the TabArena maintainers: the entry is Lite-only and its pull request is
+    #: on hold, so it carries no verified mark.
+    verified=False,
 )
 
 fintfm_linprobe_info = ModelInfo(
