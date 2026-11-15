@@ -21,7 +21,7 @@ TRAIN_SAMPLE_SIZE = 20_000
 #: Fewest probe rows a partition leaf is given, however small its share of the training rows.
 LEAF_MIN_SAMPLE = 2_000
 #: Keys ``FINTFM_PROBE`` accepts; see :meth:`FinTFMLinearProbeModel._probe_options`.
-PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head"})
+PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head", "no_rep"})
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
