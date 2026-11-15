@@ -351,6 +351,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
         - ``head``: append the network's own output for the row: the log of its head's class
           probabilities, or for regression the binned regressor's own prediction. The readout
           can then keep what the head gets right and correct the rest.
+        - ``no_rep``: with ``raw``, drop the representation and read the squashed features
+          alone, on the same leaves and rows: the matched raw-only control (fintfm FINDINGS
+          §238). The network then only supplies the head for leaves whose probe is ``None``.
 
         Like ``FINTFM_PARAMS``, the options do not change the config name, so a run that sets
         them needs its own ``FINTFM_RUN_NAME``.
@@ -415,8 +418,14 @@ class FinTFMLinearProbeModel(FinTFMModel):
         """
         import numpy as np
 
-        rep = est.transform_representation(X, stage="pre_head")
-        blocks = [np.asarray(rep, dtype=np.float64)]
+        opts = self._probe_options()
+        if opts.get("no_rep") and not opts.get("raw"):
+            raise ValueError("FINTFM_PROBE no_rep needs raw: the readout would have no input")
+        blocks = (
+            []
+            if opts.get("no_rep")
+            else [np.asarray(est.transform_representation(X, stage="pre_head"), dtype=np.float64)]
+        )
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
             blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
