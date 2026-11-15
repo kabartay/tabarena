@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
+import math
+import os
 from typing import TYPE_CHECKING, ClassVar
 
 from tabarena.models.fintfm.checkpoints import (
@@ -10,6 +13,7 @@ from tabarena.models.fintfm.checkpoints import (
     REGRESSION_CHECKPOINT_UNPUBLISHED,
 )
 from tabarena.models.fintfm.model import FinTFMModel, prefetch_weights  # noqa: F401 (re-exported to info.py)
+from tabarena.models.fintfm_linprobe.target_transform import TARGET_TRANSFORMS, TargetTransform, smearing_factor
 
 if TYPE_CHECKING:
     import numpy as np
@@ -30,6 +34,8 @@ PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head", "no_rep"})
 #: (FinTFM-LinProbe, 932 Elo) was produced WITHOUT cross-fitting, so any figure from a run
 #: with this default is a new measurement; see :class:`FinTFMLinearProbeModel`.
 PROBE_CROSSFIT_FOLDS = 5
+#: The alpha grid ``reg_ridge_alphas="wide"`` names.
+WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
@@ -114,10 +120,128 @@ class FinTFMLinearProbeModel(FinTFMModel):
     _train_matrix = None
     #: Counters of the cross-fit work of the current fit, for the log line.
     _crossfit_stats: ClassVar[dict] = {}
+    #: Regression levers of the current fit (see :meth:`_parse_reg_levers`).
+    _reg_transform_name: str = "none"
+    _reg_blend = None
+    _reg_alphas = None
+    #: The fitted target transform, or ``None`` when none is applied.
+    _target_tf: TargetTransform | None = None
+    #: What the transform did: requested name, effective name, and the reason for a fallback.
+    _reg_transform_info: ClassVar[dict] = {}
+    #: Weight on the ridge prediction in the blend with the binned head, ``None`` for no blend.
+    _reg_blend_weight: float | None = None
+    #: Duan smearing factor of the log1p back-transform.
+    _reg_smear: float = 1.0
+    #: Held-out readout-row targets and predictions the blend weight and smearing are chosen on.
+    _reg_oof: ClassVar[dict] = {}
 
     def _set_default_params(self):
         super()._set_default_params()
         self._set_default_param_value("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
+        self._set_default_param_value("reg_target_transform", "none")
+        self._set_default_param_value("reg_readout_blend", None)
+        self._set_default_param_value("reg_ridge_alphas", None)
+
+    @classmethod
+    def _env_entry_overrides(cls) -> dict:
+        """The base overrides plus the regression levers set by environment variables.
+
+        - ``FINTFM_REG_TARGET_TRANSFORM``: ``reg_target_transform``, ``none``, ``log1p`` or ``quantile``.
+        - ``FINTFM_REG_BLEND``: ``reg_readout_blend``, ``cv`` or a number in [0, 1] (the weight on
+          the ridge); ``none`` or ``off`` leaves it off.
+        - ``FINTFM_REG_ALPHAS``: ``reg_ridge_alphas``, a JSON list of positive numbers, ``wide``, or
+          ``logspace:lo,hi,n`` (exponents of 10).
+
+        Returns:
+            The overrides; empty when no variable is set.
+
+        Raises:
+            ValueError: a value is malformed.
+        """
+        over = super()._env_entry_overrides()
+        tf = os.environ.get("FINTFM_REG_TARGET_TRANSFORM", "").strip().lower()
+        if tf:
+            over["reg_target_transform"] = cls._check_reg_transform(tf, source="FINTFM_REG_TARGET_TRANSFORM")
+            logger.warning("fintfm: regression target transform %s (FINTFM_REG_TARGET_TRANSFORM)", tf)
+        blend = os.environ.get("FINTFM_REG_BLEND", "").strip().lower()
+        if blend and blend not in ("none", "off"):
+            value = blend if blend == "cv" else cls._float_or_raise(blend, "FINTFM_REG_BLEND")
+            over["reg_readout_blend"] = cls._check_reg_blend(value, source="FINTFM_REG_BLEND")
+            logger.warning("fintfm: regression readout blend %s (FINTFM_REG_BLEND)", blend)
+        alphas = os.environ.get("FINTFM_REG_ALPHAS", "").strip()
+        if alphas:
+            if alphas.lower() == "wide":
+                value = "wide"
+            elif alphas.lower().startswith("logspace:"):
+                try:
+                    lo, hi, n = alphas.split(":", 1)[1].split(",")
+                    value = [float(a) for a in _logspace(float(lo), float(hi), int(n))]
+                except ValueError:
+                    raise ValueError(f"FINTFM_REG_ALPHAS logspace needs lo,hi,n, got {alphas!r}") from None
+            else:
+                try:
+                    value = json.loads(alphas)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"FINTFM_REG_ALPHAS is not valid JSON: {exc}") from exc
+            over["reg_ridge_alphas"] = cls._check_reg_alphas(value, source="FINTFM_REG_ALPHAS")
+            logger.warning("fintfm: regression ridge alphas set by FINTFM_REG_ALPHAS")
+        return over
+
+    @staticmethod
+    def _float_or_raise(text: str, name: str) -> float:
+        try:
+            return float(text)
+        except ValueError:
+            raise ValueError(f"{name} must be 'cv', 'none' or a number in [0, 1], got {text!r}") from None
+
+    @staticmethod
+    def _check_reg_transform(value, *, source: str) -> str:
+        if value is None:
+            return "none"
+        if value not in TARGET_TRANSFORMS:
+            raise ValueError(f"{source} must be one of {TARGET_TRANSFORMS}, got {value!r}")
+        return value
+
+    @staticmethod
+    def _check_reg_blend(value, *, source: str):
+        if value is None or value == "cv":
+            return value
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0.0 <= float(value) <= 1.0:
+            raise ValueError(f"{source} must be None, 'cv' or a number in [0, 1], got {value!r}")
+        return float(value)
+
+    @staticmethod
+    def _check_reg_alphas(value, *, source: str):
+        if value is None or value == "wide":
+            return value
+        try:
+            grid = [float(a) for a in value]
+        except (TypeError, ValueError):
+            raise ValueError(f"{source} must be None, 'wide' or a list of positive numbers, got {value!r}") from None
+        if not grid or any(not math.isfinite(a) or a <= 0 for a in grid):
+            raise ValueError(f"{source} must be a non-empty list of positive finite numbers, got {value!r}")
+        return grid
+
+    def _parse_reg_levers(self, params: dict, *, pop: bool) -> None:
+        """Validate the regression levers in ``params`` and keep them on the model.
+
+        Args:
+            params: The model's hyperparameters.
+            pop: Remove the keys, so the classifier never sees them.
+
+        Raises:
+            ValueError: a lever is malformed, or ``reg_readout_blend='cv'`` is set without
+                cross-fitting, which its out-of-fold head predictions need.
+        """
+        get = params.pop if pop else params.get
+        self._reg_transform_name = self._check_reg_transform(
+            get("reg_target_transform", "none"), source="reg_target_transform"
+        )
+        self._reg_blend = self._check_reg_blend(get("reg_readout_blend", None), source="reg_readout_blend")
+        self._reg_alphas = self._check_reg_alphas(get("reg_ridge_alphas", None), source="reg_ridge_alphas")
+        folds = params.get("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
+        if self._reg_blend == "cv" and not (isinstance(folds, int) and folds >= 2):
+            raise ValueError("reg_readout_blend='cv' needs probe_crossfit_folds >= 2 for out-of-fold head predictions")
 
     def preprocess(self, X, **kwargs):
         """AutoGluon's preprocess, keeping the training matrix when the readout is cross-fitted.
@@ -144,6 +268,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
     ):
         import numpy as np
 
+        self._parse_reg_levers(dict(self._get_model_params()), pop=False)
+        y = self._apply_target_transform(y)
         super()._fit(
             X,
             y,
@@ -182,7 +308,16 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if self.problem_type == "regression":
             self._leaf_probes = None
             self._linear_probe = None
+            if self._reg_blend == "cv" and hasattr(self.model, "thresholds_"):
+                raise ValueError("reg_readout_blend='cv' is not supported with threshold regression")
+            self._reg_oof = {"y": [], "ridge": [], "head": []}
+            if self._reg_blend is None:
+                self._reg_blend_weight = None
+            else:
+                self._reg_blend_weight = 1.0 if self._reg_blend == "cv" else self._reg_blend
+            self._reg_smear = 1.0
             self._fit_ridge_probe(np.asarray(Xp, dtype=np.float32), y_arr.astype(np.float64))
+            self._finish_reg_levers()
             self._log_crossfit()
             return
         if hasattr(self.model, "trees_"):
@@ -225,6 +360,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             ValueError: ``probe_crossfit_folds`` is not a non-negative integer, or is 2 or more
                 with the ``head`` probe option, which is not cross-fitted.
         """
+        self._parse_reg_levers(params, pop=True)
         folds = params.pop("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
         if isinstance(folds, bool) or not isinstance(folds, int) or folds < 0:
             raise ValueError(f"probe_crossfit_folds must be a non-negative integer, got {folds!r}")
@@ -237,6 +373,136 @@ class FinTFMLinearProbeModel(FinTFMModel):
             )
         self._crossfit_folds = folds
         return entry
+
+    def _apply_target_transform(self, y):
+        """The training target in the readout's space, and the transform kept for predict.
+
+        Only regression with ``reg_target_transform`` other than ``none`` changes ``y``. The
+        transformed target is what everything trained on ``y`` sees: the binned regressor (its
+        quantile bin edges are rank-based, so bin membership is the same for a monotone
+        transform, and only the bin representatives move into the transformed space), the target
+        encoding of categoricals, and the ridge readouts. The binned head's prediction is
+        therefore in the transformed space too, and is inverted with the ridge's.
+
+        Args:
+            y: Training target.
+
+        Returns:
+            ``y``, or a transformed series with the same index.
+        """
+        import numpy as np
+        import pandas as pd
+
+        self._target_tf = None
+        self._reg_transform_info = {"requested": self._reg_transform_name, "effective": "none", "note": None}
+        if self.problem_type != "regression" or self._reg_transform_name == "none":
+            return y
+        tf, reason = TargetTransform.fit(self._reg_transform_name, np.asarray(y), seed=int(self.random_seed))
+        if tf is None:
+            logger.warning("FinTFM-LinProbe: reg_target_transform=%s not applied: %s", self._reg_transform_name, reason)
+            self._reg_transform_info["note"] = reason
+            return y
+        self._target_tf = tf
+        self._reg_transform_info["effective"] = tf.name
+        z = tf.forward(np.asarray(y))
+        return pd.Series(z, index=getattr(y, "index", None), name=getattr(y, "name", None))
+
+    def _finish_reg_levers(self) -> None:
+        """Choose the cv blend weight and the smearing factor, on training rows only.
+
+        Both come from held-out predictions of the readout rows collected while the ridge probes
+        were fitted (:meth:`_collect_oof`): inner K-fold ridge predictions and, for the cv blend,
+        cross-fitted head predictions. No test row is involved.
+        """
+        import numpy as np
+
+        oof = self._reg_oof
+        if not oof["y"]:
+            if self._reg_blend == "cv":
+                logger.warning("FinTFM-LinProbe: no held-out rows for the cv blend; using the ridge alone.")
+            if self._target_tf is not None and self._target_tf.name == "log1p":
+                logger.warning("FinTFM-LinProbe: no held-out rows for smearing; using a factor of 1.")
+            return
+        y = np.concatenate(oof["y"])
+        ridge = np.concatenate(oof["ridge"])
+        pred = ridge
+        if self._reg_blend == "cv":
+            head = np.concatenate(oof["head"])
+            self._reg_blend_weight = self._blend_weight(y, ridge, head)
+            pred = self._reg_blend_weight * ridge + (1.0 - self._reg_blend_weight) * head
+            logger.warning(
+                "FinTFM-LinProbe: cv blend weight on the ridge %.3f (%d rows).", self._reg_blend_weight, len(y)
+            )
+        if self._target_tf is not None and self._target_tf.name == "log1p":
+            self._reg_smear = smearing_factor(y - pred)
+            logger.warning("FinTFM-LinProbe: log1p smearing factor %.4f (%d held-out rows).", self._reg_smear, len(y))
+
+    @staticmethod
+    def _blend_weight(y: np.ndarray, ridge: np.ndarray, head: np.ndarray) -> float:
+        """The weight ``w`` in [0, 1] minimising ``|w * ridge + (1 - w) * head - y|^2``.
+
+        Args:
+            y: Training targets of the held-out rows.
+            ridge: Their held-out ridge predictions.
+            head: Their held-out head predictions.
+
+        Returns:
+            The weight on the ridge; 1.0 when the two predictions coincide.
+        """
+        import numpy as np
+
+        d = ridge - head
+        den = float(d @ d)
+        if den <= 0.0:
+            return 1.0
+        return float(np.clip(float((y - head) @ d) / den, 0.0, 1.0))
+
+    def _alpha_grid(self):
+        """The ridge alpha grid: ``reg_ridge_alphas`` when set, else the one chosen by the ``raw`` option."""
+        import numpy as np
+
+        if self._reg_alphas == "wide":
+            return np.logspace(*WIDE_RIDGE_ALPHAS)
+        if self._reg_alphas is not None:
+            return np.asarray(self._reg_alphas, dtype=np.float64)
+        return np.logspace(-3, 5, 17) if self._probe_opts.get("raw") else np.logspace(-3, 3, 13)
+
+    def _collect_oof(self, pipe, rep: np.ndarray, y_sub: np.ndarray, clf, binner, X_sub: np.ndarray, fit_idx) -> None:
+        """Record held-out ridge (and head) predictions for the readout rows of one probe.
+
+        The ridge predictions come from an inner K-fold over the readout rows, at the alpha the
+        fitted ``RidgeCV`` chose, on the same cross-fitted representation. The head predictions
+        come from the cross-fit machinery, so no row is scored against a context holding it.
+
+        Args:
+            pipe: The fitted ridge pipeline.
+            rep: The readout's input for the rows.
+            y_sub: Their targets (transformed space).
+            clf: The classifier whose context conditions the rows.
+            binner: Its regressor's target binner.
+            X_sub: The rows' preprocessed features.
+            fit_idx: Per row, its index among ``clf``'s fit rows, or ``None``.
+        """
+        import numpy as np
+        from sklearn.linear_model import Ridge
+        from sklearn.model_selection import KFold
+        from sklearn.pipeline import make_pipeline
+        from sklearn.preprocessing import StandardScaler
+
+        k = self._crossfit_folds if self._crossfit_folds >= 2 else 5
+        if len(y_sub) < 2 * k:
+            return
+        alpha = float(pipe[-1].alpha_)
+        ridge = np.empty(len(y_sub), dtype=np.float64)
+        for tr, te in KFold(k, shuffle=True, random_state=int(self.random_seed)).split(rep):
+            ridge[te] = make_pipeline(StandardScaler(), Ridge(alpha=alpha)).fit(rep[tr], y_sub[tr]).predict(rep[te])
+        if self._reg_blend == "cv":
+            if fit_idx is None or binner is None:
+                return
+            head = self._crossfit_apply(clf, X_sub, fit_idx, lambda c, Xr: _binned_head(binner, c, Xr))
+            self._reg_oof["head"].append(np.asarray(head, dtype=np.float64))
+        self._reg_oof["y"].append(np.asarray(y_sub, dtype=np.float64))
+        self._reg_oof["ridge"].append(ridge)
 
     def _log_crossfit(self) -> None:
         """Log what cross-fitting cost in this fit."""
@@ -286,7 +552,14 @@ class FinTFMLinearProbeModel(FinTFMModel):
         part = self.model if hasattr(self.model, "trees_") else None
         glob = part.global_estimator_ if part is not None else self.model
         self._ridge_probe = self._fit_ridge(
-            glob.classifier_, Xp, y_arr, np.arange(n), TRAIN_SAMPLE_SIZE, seed, fit_rows=self._all_rows(n)
+            glob.classifier_,
+            Xp,
+            y_arr,
+            np.arange(n),
+            TRAIN_SAMPLE_SIZE,
+            seed,
+            fit_rows=self._all_rows(n),
+            binner=getattr(glob, "binner_", None),
         )
         self._ridge_leaf_probes = None
         if part is None:
@@ -314,6 +587,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     budget,
                     seed + 1 + b * 1000 + leaf,
                     fit_rows=self._leaf_fit_rows(part, b, members, est.classifier_),
+                    binner=getattr(est, "binner_", None),
                 )
             self._ridge_leaf_probes.append(probes)
         n_leaf = sum(p is not None for probes in self._ridge_leaf_probes for p in probes.values())
@@ -359,7 +633,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         rng = np.random.default_rng(seed)
         n = len(y_arr)
         sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
-        alphas = np.logspace(-3, 5, 17) if self._probe_opts.get("raw") else np.logspace(-3, 3, 13)
+        alphas = self._alpha_grid()
         feats = self._threshold_input(Xp[sub])
         return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(feats, y_arr[sub])
 
@@ -372,6 +646,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         budget: int,
         seed: int,
         fit_rows: np.ndarray | None = None,
+        binner=None,
     ):
         """A standardised ``RidgeCV`` on ``clf``'s representation of up to ``budget`` of ``members``.
 
@@ -384,6 +659,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             seed: Seed of that draw.
             fit_rows: Sorted indices into ``Xp`` of the rows ``clf`` was fitted on, to cross-fit
                 the representation of those among the drawn rows; ``None`` for no cross-fitting.
+            binner: ``clf``'s regressor's target binner, for the head predictions of the cv blend.
 
         Returns:
             The fitted pipeline.
@@ -398,10 +674,13 @@ class FinTFMLinearProbeModel(FinTFMModel):
         sub = members[np.sort(rng.choice(m, size=budget, replace=False))] if m > budget else members
         # A wider grid when raw columns join the representation: a 1,024-column table can need
         # far more shrinkage than the representation alone.
-        alphas = np.logspace(-3, 5, 17) if self._probe_opts.get("raw") else np.logspace(-3, 3, 13)
+        alphas = self._alpha_grid()
         fit_idx = None if fit_rows is None else _positions_in(fit_rows, sub)
         rep = self._probe_input(clf, Xp[sub], fit_idx)
-        return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
+        pipe = make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
+        if self._reg_blend == "cv" or (self._target_tf is not None and self._target_tf.name == "log1p"):
+            self._collect_oof(pipe, rep, y_arr[sub], clf, binner, Xp[sub], fit_idx)
+        return pipe
 
     def _fit_leaf_probes(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit one probe per leaf context of a partitioned classifier, plus one global probe.
@@ -564,11 +843,6 @@ class FinTFMLinearProbeModel(FinTFMModel):
     def _crossfit_representation(self, clf, X: np.ndarray, fit_idx: np.ndarray) -> np.ndarray:
         """Pre-head representation of ``X`` with no row seeing its own labelled copy.
 
-        Rows whose ``fit_idx`` is in ``clf``'s stored context are split into
-        ``probe_crossfit_folds`` folds by a seeded shuffle of the context, and each fold is
-        represented under ``clf`` restricted to the rest of the context. Other rows are
-        represented under the full context, as test rows are.
-
         Args:
             clf: A fitted ``FinancialTFMClassifier``.
             X: Preprocessed rows.
@@ -576,6 +850,32 @@ class FinTFMLinearProbeModel(FinTFMModel):
 
         Returns:
             ``(n, d)`` representations.
+        """
+        import numpy as np
+
+        return self._crossfit_apply(
+            clf,
+            X,
+            fit_idx,
+            lambda c, Xr: np.asarray(c.transform_representation(Xr, stage="pre_head"), dtype=np.float64),
+        )
+
+    def _crossfit_apply(self, clf, X: np.ndarray, fit_idx: np.ndarray, fn) -> np.ndarray:
+        """``fn(estimator, rows)`` for ``X`` with no row seen by a context holding it.
+
+        Rows whose ``fit_idx`` is in ``clf``'s stored context are split into
+        ``probe_crossfit_folds`` folds by a seeded shuffle of the context, and each fold is
+        evaluated under ``clf`` restricted to the rest of the context. Other rows are evaluated
+        under the full context, as test rows are.
+
+        Args:
+            clf: A fitted ``FinancialTFMClassifier``.
+            X: Preprocessed rows.
+            fit_idx: Per row, its index among the rows ``clf``'s ``fit`` received, or -1.
+            fn: Maps an estimator and rows to one output row per input row.
+
+        Returns:
+            The outputs, stacked in the order of ``X``.
         """
         import numpy as np
 
@@ -592,7 +892,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         blocks: list[tuple[np.ndarray, np.ndarray]] = []
         out = np.flatnonzero(~in_ctx)
         if out.size:
-            blocks.append((out, np.asarray(clf.transform_representation(X[out], stage="pre_head"), dtype=np.float64)))
+            blocks.append((out, fn(clf, X[out])))
             stats["other_rows"] += int(out.size)
         if in_ctx.any():
             parts = np.array_split(np.random.default_rng(int(self.random_seed) + 7919).permutation(ctx.size), k)
@@ -607,13 +907,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 twin = self._restricted(clf, np.delete(ctx, part))
                 stats["restricted"] += 1
                 stats["context_rows"] += int(rows.size)
-                blocks.append(
-                    (rows, np.asarray(twin.transform_representation(X[rows], stage="pre_head"), dtype=np.float64))
-                )
-        rep = np.empty((len(X), blocks[0][1].shape[1]), dtype=np.float64)
+                blocks.append((rows, fn(twin, X[rows])))
+        res = np.empty((len(X), *blocks[0][1].shape[1:]), dtype=np.float64)
         for rows, r in blocks:
-            rep[rows] = r
-        return rep
+            res[rows] = r
+        return res
 
     def _score(self, est, probe, X: np.ndarray) -> np.ndarray:
         """Class probabilities for ``X`` from ``probe`` on ``est``'s representation, or ``est``'s head.
@@ -755,21 +1053,13 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if getattr(self, "_ridge_probe", None) is not None:
             # Regression: AutoGluon reads this method's output as the predictions themselves.
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
-            if hasattr(self.model, "thresholds_"):
-                return self._ridge_probe.predict(self._threshold_input(Xp))
-            if getattr(self, "_ridge_leaf_probes", None) is None:
-                return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
-            part = self.model
-            routes = part.route(Xp)
-            out = np.zeros(Xp.shape[0], dtype=np.float64)
-            for b, leaves in enumerate(part.leaf_estimators_):
-                for leaf in np.unique(routes[b]):
-                    rows = np.flatnonzero(routes[b] == leaf)
-                    est, probe = leaves.get(int(leaf)), self._ridge_leaf_probes[b].get(int(leaf))
-                    if est is None or probe is None:
-                        est, probe = part.global_estimator_, self._ridge_probe
-                    out[rows] += probe.predict(self._probe_input(est.classifier_, Xp[rows]))
-            return out / len(part.leaf_estimators_)
+            pred = self._predict_ridge(Xp)
+            if self._reg_blend_weight is not None and self._reg_blend_weight < 1.0:
+                head = np.asarray(self.model.predict(Xp), dtype=np.float64)
+                pred = self._reg_blend_weight * pred + (1.0 - self._reg_blend_weight) * head
+            if self._target_tf is not None:
+                pred = self._target_tf.inverse(pred, self._reg_smear)
+            return pred
         if getattr(self, "_leaf_probes", None) is not None:
             Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
             part = self.model
@@ -798,6 +1088,52 @@ class FinTFMLinearProbeModel(FinTFMModel):
         X = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
         proba = self._linear_probe.predict_proba(self._probe_input(self.model, X))
         return self._convert_proba_to_unified_form(proba)
+
+    def _predict_ridge(self, Xp: np.ndarray) -> np.ndarray:
+        """The ridge readout's prediction for preprocessed rows, in the transformed target space."""
+        import numpy as np
+
+        if hasattr(self.model, "thresholds_"):
+            return self._ridge_probe.predict(self._threshold_input(Xp))
+        if getattr(self, "_ridge_leaf_probes", None) is None:
+            return self._ridge_probe.predict(self._probe_input(self.model.classifier_, Xp))
+        part = self.model
+        routes = part.route(Xp)
+        out = np.zeros(Xp.shape[0], dtype=np.float64)
+        for b, leaves in enumerate(part.leaf_estimators_):
+            for leaf in np.unique(routes[b]):
+                rows = np.flatnonzero(routes[b] == leaf)
+                est, probe = leaves.get(int(leaf)), self._ridge_leaf_probes[b].get(int(leaf))
+                if est is None or probe is None:
+                    est, probe = part.global_estimator_, self._ridge_probe
+                out[rows] += probe.predict(self._probe_input(est.classifier_, Xp[rows]))
+        return out / len(part.leaf_estimators_)
+
+
+def _binned_head(binner, est, X: np.ndarray) -> np.ndarray:
+    """The binned regressor's mean prediction from classifier ``est`` for rows ``X``.
+
+    Args:
+        binner: The regressor's fitted target binner.
+        est: A fitted classifier over the bin indices, possibly with a restricted context.
+        X: Preprocessed rows.
+
+    Returns:
+        ``(n,)`` expected values, in the target space the regressor was fitted in.
+    """
+    import numpy as np
+
+    proba = est.predict_proba(X)
+    full = np.zeros((proba.shape[0], binner.n_bins_), dtype=np.float64)
+    full[:, np.asarray(est.classes_).astype(int)] = proba
+    return binner.expected_value(full)
+
+
+def _logspace(lo: float, hi: float, n: int) -> list[float]:
+    """``n`` values from ``10**lo`` to ``10**hi``, log-spaced."""
+    import numpy as np
+
+    return list(np.logspace(lo, hi, n))
 
 
 def _positions_in(fit_rows: np.ndarray, rows: np.ndarray) -> np.ndarray:
