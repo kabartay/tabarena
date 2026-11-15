@@ -226,7 +226,16 @@ class FinTFMModel(AbstractTorchModel):
         # the prior emitted continuous targets during pretraining, which the binary and
         # multiclass checkpoints never did.
         regression_path = params.pop("model_path_regression", None) or os.environ.get("FINTFM_CHECKPOINT_REGRESSION")
-        n_bins = int(params.pop("n_bins", 10))
+        # FINTFM_REG_BINS sets the regression bin count from the environment, beside
+        # FINTFM_REG_THRESHOLDS: FINTFM_PARAMS only takes FinancialTFMClassifier arguments, and
+        # n_bins is the regressor's (fintfm 2026-11-15, the 20-class checkpoint). A
+        # hyperparameter still wins; the head's max_classes still clamps it below.
+        env_bins = os.environ.get("FINTFM_REG_BINS", "").strip()
+        n_bins = int(params.pop("n_bins", env_bins or 10))
+        if n_bins < 2:
+            raise ValueError(f"n_bins must be at least 2, got {n_bins} (FINTFM_REG_BINS={env_bins!r})")
+        if env_bins and self.problem_type == "regression":
+            logger.warning("fintfm: regression n_bins %d (FINTFM_REG_BINS=%s)", n_bins, env_bins)
         checkpoint = params.pop("model_path", None) or os.environ.get("FINTFM_CHECKPOINT")
         if self.problem_type == "multiclass" and multiclass_path:
             checkpoint = multiclass_path
