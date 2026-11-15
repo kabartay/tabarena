@@ -108,7 +108,8 @@ def test_environment_overrides_the_default(monkeypatch, tmp_path):
     monkeypatch.setenv("FINTFM_CHECKPOINT", "/some/generic.pt")
     monkeypatch.setenv("FINTFM_CHECKPOINT_REGRESSION", "/some/reg.pt")
     for problem_type in ENTRY:
-        entry, rest = resolve(make(problem_type, tmp_path))
+        # head is refused beside cross-fitting, so this case turns cross-fitting off.
+        entry, rest = resolve(make(problem_type, tmp_path, probe_crossfit_folds=0))
         assert entry["partition"] == {"n_bags": 2}
         assert entry["probe"] == {"raw": True, "head": True}
         assert entry["n_bins"] == 20
@@ -224,3 +225,17 @@ def test_published_checkpoint_checks_the_sha256(monkeypatch, tmp_path):
     monkeypatch.setattr("huggingface_hub.hf_hub_download", lambda **kwargs: str(fake))
     with pytest.raises(ValueError, match="expected d231b062"):
         resolve_checkpoint(BINARY_CHECKPOINT, problem_type="binary")
+
+
+def test_search_space_keys_are_read_and_its_first_values_are_the_entry(tmp_path):
+    from tabarena.models.fintfm_linprobe.hpo import proposed_search_space_additions, search_space
+
+    params = make("binary", tmp_path)._get_model_params()
+    for key, space in search_space.items():
+        assert key in params, f"{key} is not a hyperparameter the model reads"
+        assert space.default == params[key], f"the first value of {key} is not the measured entry's"
+        assert params[key] in list(space.data)
+    # The proposal names a hyperparameter the model reads, and is not sampled.
+    assert set(proposed_search_space_additions) == {"probe_crossfit_folds"}
+    assert set(proposed_search_space_additions).isdisjoint(search_space)
+    assert set(proposed_search_space_additions) <= set(params)

@@ -6,35 +6,52 @@ from tabarena.models.fintfm_linprobe.model import FinTFMLinearProbeModel
 from tabarena.utils.config_utils import ConfigGenerator
 
 #: PROPOSED search space for "FinTFM with a trained linear readout", not a tuned one. No
-#: sampled config has been run on TabArena; the keys are the readout's own knobs that the
-#: measured runs (fintfm ``docs/results/TABARENA.md``, "The 51-dataset Lite entry", §220 to
-#: §224) switched on or off, so a sampled config stays inside what was measured:
+#: sampled config has been run on TabArena. The keys are the hyperparameters ``model.py`` reads,
+#: and the first value of each is the measured entry's value (fintfm ``docs/results/FINDINGS.md``
+#: §232, §235, §237), so the default config is the entry and a test pins that:
 #:
-#: - ``probe_scale``, ``probe_cv``, ``probe_raw``, ``probe_head``: the ``FINTFM_PROBE`` options
-#:   ``scale`` (standardise the readout's inputs), ``cv`` (choose the logistic regression's
-#:   ``C`` by 3-fold log loss over 10^-3 to 10^2, the only readout regularisation exposed),
-#:   ``raw`` (append the row's own squashed features, which the entry must declare) and
-#:   ``head`` (append the network's own log probabilities; measured and not kept in §224).
-#: - ``partition_n_bags``: bags of the tree partition (``FINTFM_PARTITION`` ``n_bags``); 1 is the
-#:   binary entry, 4 the multiclass one. Not applied to regression.
+#: - ``probe_binary``, ``probe_multiclass``, ``probe_regression``: the readout options dict.
+#:   ``scale`` standardises the readout's inputs, ``cv`` chooses the logistic regression's ``C``
+#:   by 3-fold log loss over 10^-3 to 10^2, ``raw`` appends the row's own squashed features.
+#:   The candidates are the entry and its ablations (without ``raw``; plain). The regression
+#:   readout is a ridge and reads only ``raw``. ``head`` is left out: it is refused while
+#:   ``probe_crossfit_folds`` is 2 or more, which is the default.
+#: - ``partition_binary``, ``partition_multiclass``: the tree partition's arguments. ``{}`` is
+#:   one bag at the class defaults (the binary entry), ``{"n_bags": 8}`` the multiclass entry.
+#:   The other bag counts are candidates that have not been measured on TabArena. Regression is
+#:   not sampled: ``partition_regression`` stays at the entry's 4 bags.
 #:
 #: Left out on purpose: ``no_rep`` (a control, not a candidate), the partition depth and leaf
 #: floor (only depth 2 and 0.05 were measured), ``max_context`` (4,000 changed nothing on
-#: multiclass, §224) and 8 bags (queued, no result). The ridge readout for regression ignores
-#: ``probe_scale`` and ``probe_cv``; it reads ``probe_raw`` and ``probe_head``.
+#: multiclass, §224). A sampled dict replaces the entry's whole dict for its problem type. The
+#: readout adds a fit of up to 20,000 representation rows per leaf, so a tuned run is GPU work,
+#: as for FinTFM.
 #:
-#: The default config is ``manual_configs=[{}]``: it carries no override, so it is whatever
-#: the wrapper's own defaults are, which must equal the measured entry. These key names are
-#: provisional until they match the hyperparameters ``model.py`` reads in place of the
-#: ``FINTFM_PROBE`` and ``FINTFM_PARTITION`` variables; a key the wrapper does not read must
-#: not be sampled. The readout adds a fit of up to 20,000 representation rows per leaf, so a
-#: tuned run is GPU work, as for FinTFM.
+#: The default config is ``manual_configs=[{}]``: it carries no override, so it is whatever the
+#: wrapper's own defaults are, which must equal the measured entry.
 search_space = {
-    "probe_scale": Categorical(False, True),
-    "probe_cv": Categorical(False, True),
-    "probe_raw": Categorical(False, True),
-    "probe_head": Categorical(False, True),
-    "partition_n_bags": Categorical(1, 4),
+    "probe_binary": Categorical(
+        {"scale": True, "cv": True, "raw": True},
+        {"scale": True, "cv": True},
+        {},
+    ),
+    "probe_multiclass": Categorical(
+        {"scale": True, "cv": True, "raw": True},
+        {"scale": True, "cv": True},
+        {},
+    ),
+    "probe_regression": Categorical({"raw": True}, {}),
+    "partition_binary": Categorical({}, {"n_bags": 4}),
+    "partition_multiclass": Categorical({"n_bags": 8}, {"n_bags": 4}, {}),
+}
+
+#: PROPOSAL, not part of ``search_space``: ``probe_crossfit_folds`` (``model.py``) is 5 by default,
+#: cross-fitting the readout's training rows against a context that leaves each out. The measured
+#: 932 Elo entry was produced with it off (``0``). Sampling it only makes sense after the default
+#: has been re-measured, to ask whether 2, 3, 5 or 10 folds matter; until then it is a setting to
+#: fix, not to tune. ``0`` also makes the ``head`` probe option available again.
+proposed_search_space_additions = {
+    "probe_crossfit_folds": Categorical(5, 0),
 }
 
 gen_fintfm_linprobe = ConfigGenerator(
