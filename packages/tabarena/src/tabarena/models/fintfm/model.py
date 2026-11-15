@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import os
 from typing import TYPE_CHECKING, ClassVar
@@ -7,18 +9,30 @@ from typing import TYPE_CHECKING, ClassVar
 from autogluon.features import LabelEncoderFeatureGenerator
 from autogluon.tabular.models.abstract.abstract_torch_model import AbstractTorchModel
 
+from tabarena.models.fintfm.checkpoints import (
+    BINARY_CHECKPOINT,
+    MULTICLASS_CHECKPOINT_UNPUBLISHED,
+    REGRESSION_CHECKPOINT_UNPUBLISHED,
+    resolve_checkpoint,
+    validate_checkpoint_ref,
+)
+
 if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-#: The published binary checkpoint, Apache-2.0 and ungated, pinned to a **commit** rather than
-#: a branch. A moving reference would let the weights change underneath a recorded leaderboard
-#: number, which is the one thing a benchmark entry cannot tolerate.
-HF_REPO_ID = "kabartay/fintfm-binary"
-HF_REVISION = "f116bfd43a2b15c65ed3551ea8c38e3364629ddc"
-HF_FILENAME = "v4-cellattn-labels.pt"
+#: Marks an environment variable that is not set, since ``null`` is a valid JSON value.
+_UNSET = object()
+
+#: Hugging Face coordinates of the published binary checkpoint, kept under their earlier names.
+HF_REPO_ID = BINARY_CHECKPOINT["repo_id"]
+HF_REVISION = BINARY_CHECKPOINT["revision"]
+HF_FILENAME = BINARY_CHECKPOINT["filename"]
+
+#: Problem types a checkpoint, partition and probe can be set for.
+PROBLEM_TYPES = ("binary", "multiclass", "regression")
 
 
 def prefetch_weights() -> str:
@@ -26,15 +40,9 @@ def prefetch_weights() -> str:
 
     Declared in ``info.py`` so the benchmark harness can stage weights before a run rather
     than downloading inside the first fit, where the transfer would be charged to that fit's
-    time limit.
+    time limit. The file's SHA-256 is checked against :data:`BINARY_CHECKPOINT`.
     """
-    from huggingface_hub import hf_hub_download
-
-    return hf_hub_download(
-        repo_id=HF_REPO_ID,
-        filename=HF_FILENAME,
-        revision=HF_REVISION,
-    )
+    return resolve_checkpoint(BINARY_CHECKPOINT, problem_type="binary")
 
 
 class FinTFMModel(AbstractTorchModel):
@@ -137,6 +145,25 @@ class FinTFMModel(AbstractTorchModel):
         "refit_folds": True,
     }
 
+    #: The measured entry's settings, which the default config uses when no environment variable
+    #: or hyperparameter changes them. A subclass overrides them to be a different entry.
+    #:
+    #: ``_entry_params`` are ``FinancialTFMClassifier`` arguments. The dicts keyed by problem
+    #: type become the hyperparameters ``checkpoint_<type>``, ``partition_<type>`` and (in a
+    #: class with a probe) ``probe_<type>``. ``None`` partitions nothing. Precedence: a
+    #: hyperparameter passed explicitly, then an environment variable, then these. This class
+    #: is the zero-shot head: no partition, and only the binary checkpoint is published.
+    _entry_params: ClassVar[dict] = {}
+    _entry_n_bins: ClassVar[int] = 10
+    _entry_checkpoint: ClassVar[dict] = {
+        "binary": BINARY_CHECKPOINT,
+        "multiclass": MULTICLASS_CHECKPOINT_UNPUBLISHED,
+        "regression": REGRESSION_CHECKPOINT_UNPUBLISHED,
+    }
+    _entry_partition: ClassVar[dict] = {"binary": None, "multiclass": None, "regression": None}
+    #: Names of the per-problem-type options this class has hyperparameters for.
+    _per_problem_options: ClassVar[tuple[str, ...]] = ("checkpoint", "partition")
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._feature_generator: LabelEncoderFeatureGenerator | None = None
@@ -216,36 +243,15 @@ class FinTFMModel(AbstractTorchModel):
         from fintfm.modeling.model import FinancialTFM
 
         params = self._get_model_params()
+        entry = self._resolve_entry(params)
+        n_bins = entry["n_bins"]
         # Binary and multiclass take **different checkpoints on purpose.** A multiclass
         # checkpoint is trained at max_classes=10 with the generic SCM prior mixed in, which
         # is a different model from the financial-prior binary one; using it for binary tasks
-        # would silently change every binary number this project has published. Selecting by
-        # problem type keeps the binary results comparable with §98/§101.
-        multiclass_path = params.pop("model_path_multiclass", None) or os.environ.get("FINTFM_CHECKPOINT_MULTICLASS")
-        # Regression takes its own checkpoint again: the binned head only means anything if
-        # the prior emitted continuous targets during pretraining, which the binary and
-        # multiclass checkpoints never did.
-        regression_path = params.pop("model_path_regression", None) or os.environ.get("FINTFM_CHECKPOINT_REGRESSION")
-        # FINTFM_REG_BINS sets the regression bin count from the environment, beside
-        # FINTFM_REG_THRESHOLDS: FINTFM_PARAMS only takes FinancialTFMClassifier arguments, and
-        # n_bins is the regressor's (fintfm 2026-11-15, the 20-class checkpoint). A
-        # hyperparameter still wins; the head's max_classes still clamps it below.
-        env_bins = os.environ.get("FINTFM_REG_BINS", "").strip()
-        n_bins = int(params.pop("n_bins", env_bins or 10))
-        if n_bins < 2:
-            raise ValueError(f"n_bins must be at least 2, got {n_bins} (FINTFM_REG_BINS={env_bins!r})")
-        if env_bins and self.problem_type == "regression":
-            logger.warning("fintfm: regression n_bins %d (FINTFM_REG_BINS=%s)", n_bins, env_bins)
-        checkpoint = params.pop("model_path", None) or os.environ.get("FINTFM_CHECKPOINT")
-        if self.problem_type == "multiclass" and multiclass_path:
-            checkpoint = multiclass_path
-        elif self.problem_type == "regression" and regression_path:
-            checkpoint = regression_path
-        if not checkpoint:
-            # Fall back to the published binary weights so the model runs without setup.
-            # An explicit ``model_path`` or ``FINTFM_CHECKPOINT`` takes precedence, which is
-            # how the private multiclass and regression checkpoints are supplied.
-            checkpoint = prefetch_weights()
+        # would silently change every binary number this project has published. Regression
+        # takes its own checkpoint again: the binned head only means anything if the prior
+        # emitted continuous targets during pretraining, which the others never did.
+        checkpoint = resolve_checkpoint(entry["checkpoint"], problem_type=self.problem_type)
 
         # Prefer any real accelerator. AutoGluon's GPU accounting is CUDA-only, so a machine
         # with Apple Silicon reports zero GPUs and would otherwise run this on CPU -- which is
@@ -264,13 +270,13 @@ class FinTFMModel(AbstractTorchModel):
 
         X = self.preprocess(X, y=y, is_train=True)
         if self.problem_type == "regression":
-            self._fit_regression(X, np.asarray(y), network, device, n_bins, params)
+            self._fit_regression(X, np.asarray(y), network, device, n_bins, params, entry["partition"])
             return
         n_classes = int(np.unique(np.asarray(y)).size)
         if n_classes > network.cfg.max_classes:
             raise AssertionError(
                 f"fintfm checkpoint represents at most {network.cfg.max_classes} classes, "
-                f"task has {n_classes}. Set FINTFM_CHECKPOINT_MULTICLASS to a checkpoint "
+                f"task has {n_classes}. Set checkpoint_multiclass (or FINTFM_CHECKPOINT_MULTICLASS) to a checkpoint "
                 f"trained at --max-classes {n_classes} or higher; scoring anyway would "
                 f"measure a task the model cannot represent."
             )
@@ -295,7 +301,7 @@ class FinTFMModel(AbstractTorchModel):
         if self._minority_flipped:
             y_fit = 1 - y_fit
         classifier = FinancialTFMClassifier(network, device=device, **params)
-        partition = self._env_partition()
+        partition = entry["partition"]
         if partition is not None:
             from fintfm.inference.large_n import PartitionedTFMClassifier
 
@@ -365,7 +371,7 @@ class FinTFMModel(AbstractTorchModel):
             proba = proba[:, ::-1]
         return self._convert_proba_to_unified_form(proba)
 
-    def _fit_regression(self, X, y, network, device: str, n_bins: int, params: dict):
+    def _fit_regression(self, X, y, network, device: str, n_bins: int, params: dict, partition: dict | None):
         """Store the table as context for the binned-regression wrapper.
 
         ``n_bins`` is clamped to the checkpoint's ``max_classes`` rather than raising,
@@ -396,7 +402,6 @@ class FinTFMModel(AbstractTorchModel):
             )
         params.setdefault("random_state", self.random_seed)
         regressor = FinancialTFMRegressor(network, n_bins=bins, classifier_params={"device": device, **params})
-        partition = self._env_partition()
         thresholds = os.environ.get("FINTFM_REG_THRESHOLDS", "").strip()
         if thresholds:
             # K binary classifiers on y > t_k instead of one classifier over max_classes bins
@@ -404,7 +409,7 @@ class FinTFMModel(AbstractTorchModel):
             from fintfm.inference.threshold_regressor import ThresholdTFMRegressor
 
             if partition is not None:
-                raise ValueError("FINTFM_REG_THRESHOLDS and FINTFM_PARTITION are not combined yet")
+                raise ValueError("FINTFM_REG_THRESHOLDS and a regression partition are not combined yet")
             regressor = ThresholdTFMRegressor(
                 network, n_thresholds=int(thresholds), classifier_params={"device": device, **params}
             )
@@ -496,51 +501,162 @@ class FinTFMModel(AbstractTorchModel):
         return params
 
     @staticmethod
-    def _env_partition() -> dict | None:
-        """Tree-partitioned contexts from ``FINTFM_PARTITION``, or ``None`` when unset.
+    def _env_json(name: str):
+        """The JSON value of environment variable ``name``, or ``_UNSET`` when it is unset or blank.
+
+        Raises:
+            ValueError: the value is not valid JSON.
+        """
+        raw = os.environ.get(name)
+        if raw is None or raw.strip() == "":
+            return _UNSET
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{name} is not valid JSON: {exc}") from exc
+
+    @staticmethod
+    def _validated_partition(value, *, source: str) -> dict | None:
+        """Check a partition setting; ``None`` means no partition, ``{}`` the class defaults.
 
         Fix 4 of fintfm's TabArena loss analysis: wrap the classifier in
         ``fintfm.inference.large_n.PartitionedTFMClassifier``, a shallow decision tree whose
         leaves each carry their own context, with the global context as the fallback for a
         leaf too small or missing a class (fintfm ``docs/results/FINDINGS.md`` §169, +0.0375
-        mean AP on V4FinBench at depth 2 with a 5% leaf floor). The value is a JSON object
-        of that class's arguments; ``{}`` takes its defaults, which are §169's. ``estimator``
-        and ``random_state`` are set by the adapter and refused here, and a misspelled key
-        raises for the reason ``_env_params`` gives. Like ``FINTFM_PARAMS``, it does not
-        change the config name, so an arm needs its own results directory.
+        mean AP on V4FinBench at depth 2 with a 5% leaf floor). The value is a dict of that
+        class's arguments; ``{}`` takes its defaults, which are §169's. ``estimator`` and
+        ``random_state`` are set by the adapter and refused here, and a misspelled key raises
+        rather than being ignored, because an ignored setting completes the run and reports
+        the default's numbers under the arm's name.
+
+        Args:
+            value: ``None`` or a dict of partition arguments.
+            source: Where the value came from, for the message.
 
         Returns:
-            The partition arguments, or ``None`` for the unpartitioned default.
+            ``value``, validated.
 
         Raises:
-            ValueError: the variable is not a JSON object or names an unknown or reserved
-                argument.
+            ValueError: ``value`` is neither ``None`` nor a dict, or names an unknown or
+                reserved argument.
         """
         import inspect
-        import json
 
-        raw = os.environ.get("FINTFM_PARTITION")
-        if raw is None or raw.strip() == "":
+        if value is None:
             return None
-        try:
-            params = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"FINTFM_PARTITION is not valid JSON: {exc}") from exc
-        if not isinstance(params, dict):
-            raise ValueError(f"FINTFM_PARTITION must be a JSON object, got {type(params).__name__}")
+        if not isinstance(value, dict):
+            raise ValueError(f"{source} must be a JSON object or null, got {type(value).__name__}")
 
         from fintfm.inference.large_n import PartitionedTFMClassifier
 
         reserved = {"self", "estimator", "random_state"}
         allowed = set(inspect.signature(PartitionedTFMClassifier.__init__).parameters) - reserved
-        unknown = sorted(set(params) - allowed)
+        unknown = sorted(set(value) - allowed)
         if unknown:
             raise ValueError(
-                f"FINTFM_PARTITION names {unknown}, which are not PartitionedTFMClassifier "
+                f"{source} names {unknown}, which are not PartitionedTFMClassifier "
                 f"arguments the adapter lets you set; allowed: {sorted(allowed)}"
             )
-        logger.warning("fintfm: partitioned contexts on, FINTFM_PARTITION: %s", params)
-        return params
+        return value
+
+    @classmethod
+    def _env_entry_overrides(cls) -> dict:
+        """Entry hyperparameter defaults set by environment variables, keyed by hyperparameter name.
+
+        The variables set a default, so the precedence is: a hyperparameter passed explicitly,
+        then the environment variable, then the entry default. Each variable applies to every
+        problem type.
+
+        - ``FINTFM_PARTITION``: ``partition_<type>``; a JSON object, or ``null`` for no partition.
+        - ``FINTFM_PROBE``: ``probe_<type>``, for classes that have a probe; a JSON object.
+        - ``FINTFM_CHECKPOINT``: ``checkpoint_<type>`` for every type, then
+          ``FINTFM_CHECKPOINT_MULTICLASS`` and ``FINTFM_CHECKPOINT_REGRESSION`` for theirs. Local paths.
+        - ``FINTFM_REG_BINS``: ``n_bins``.
+        - ``FINTFM_REG_THRESHOLDS``: no partition for regression, unless ``FINTFM_PARTITION`` is set,
+          because the threshold regressor is not combined with one.
+
+        Returns:
+            The overrides; empty when no variable is set.
+
+        Raises:
+            ValueError: a JSON variable is malformed, or ``FINTFM_REG_BINS`` is not an integer.
+        """
+        over: dict = {}
+        options = cls._per_problem_options
+        partition = cls._env_json("FINTFM_PARTITION")
+        if "partition" in options:
+            if partition is not _UNSET:
+                for pt in PROBLEM_TYPES:
+                    over[f"partition_{pt}"] = partition
+                logger.warning("fintfm: partition set by FINTFM_PARTITION: %s", partition)
+            elif os.environ.get("FINTFM_REG_THRESHOLDS", "").strip():
+                over["partition_regression"] = None
+        probe = cls._env_json("FINTFM_PROBE")
+        if "probe" in options and probe is not _UNSET:
+            for pt in PROBLEM_TYPES:
+                over[f"probe_{pt}"] = probe
+            logger.warning("fintfm: probe options set by FINTFM_PROBE: %s", probe)
+        if "checkpoint" in options:
+            generic = os.environ.get("FINTFM_CHECKPOINT", "").strip()
+            for pt in PROBLEM_TYPES:
+                specific = os.environ.get(f"FINTFM_CHECKPOINT_{pt.upper()}", "").strip() if pt != "binary" else ""
+                if specific or generic:
+                    over[f"checkpoint_{pt}"] = specific or generic
+        env_bins = os.environ.get("FINTFM_REG_BINS", "").strip()
+        if env_bins:
+            try:
+                over["n_bins"] = int(env_bins)
+            except ValueError:
+                raise ValueError(f"FINTFM_REG_BINS must be an integer, got {env_bins!r}") from None
+            logger.warning("fintfm: regression n_bins %d (FINTFM_REG_BINS)", over["n_bins"])
+        return over
+
+    def _resolve_entry(self, params: dict) -> dict:
+        """Take this fit's adapter settings out of ``params``, for the task's problem type.
+
+        Removes every key that is not a ``FinancialTFMClassifier`` argument (the
+        per-problem-type ``checkpoint_*``, ``partition_*`` and, where the class has it,
+        ``probe_*``; ``n_bins``; ``model_path*``) so the rest can be passed on unchanged, and
+        returns the ones that apply to ``self.problem_type``.
+
+        Args:
+            params: The model's hyperparameters; modified in place.
+
+        Returns:
+            A dict with ``checkpoint`` (a path string or a reference from
+            :mod:`tabarena.models.fintfm.checkpoints`, not yet resolved), ``partition``
+            (``None`` or a validated dict), ``probe`` (``None`` or a dict; ``None`` for classes
+            without a probe) and ``n_bins`` (an int of at least 2).
+
+        Raises:
+            ValueError: the problem type is not binary, multiclass or regression, or a value
+                is malformed.
+        """
+        pt = self.problem_type
+        if pt not in PROBLEM_TYPES:
+            raise ValueError(f"fintfm supports {PROBLEM_TYPES}, not problem type {pt!r}")
+        per_type = {
+            opt: {t: params.pop(f"{opt}_{t}", None) for t in PROBLEM_TYPES} for opt in self._per_problem_options
+        }
+        # An explicit local path beats the checkpoint hyperparameters. The type-specific one
+        # beats the generic ``model_path``.
+        explicit = {t: params.pop(f"model_path_{t}", None) for t in ("multiclass", "regression")}
+        generic = params.pop("model_path", None)
+        n_bins = int(params.pop("n_bins", self._entry_n_bins))
+        if n_bins < 2:
+            raise ValueError(f"n_bins must be at least 2, got {n_bins}")
+
+        checkpoint = explicit.get(pt) or generic or per_type.get("checkpoint", {}).get(pt)
+        if checkpoint is None:
+            raise ValueError(f"no checkpoint is set for problem type {pt!r}")
+        validate_checkpoint_ref(checkpoint, source=f"checkpoint_{pt}")
+        partition = self._validated_partition(per_type.get("partition", {}).get(pt), source=f"partition_{pt}")
+        return {
+            "checkpoint": checkpoint,
+            "partition": partition,
+            "probe": per_type.get("probe", {}).get(pt),
+            "n_bins": n_bins,
+        }
 
     def _inner_classifiers(self) -> list:
         """Every fitted ``FinancialTFMClassifier`` behind ``self.model``.
@@ -570,7 +686,14 @@ class FinTFMModel(AbstractTorchModel):
             # materialised (CPU and MPS). No effect on CUDA (§95).
             "feature_chunk": 16,
         }
+        default_params.update(copy.deepcopy(self._entry_params))
         default_params.update(self._env_params())
+        default_params["n_bins"] = self._entry_n_bins
+        for option in self._per_problem_options:
+            entry_values = getattr(self, f"_entry_{option}")
+            for pt in PROBLEM_TYPES:
+                default_params[f"{option}_{pt}"] = copy.deepcopy(entry_values[pt])
+        default_params.update(self._env_entry_overrides())
         for param, val in default_params.items():
             self._set_default_param_value(param, val)
 

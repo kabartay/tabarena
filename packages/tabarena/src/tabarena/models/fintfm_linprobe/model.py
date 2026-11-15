@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import json
 import logging
-import os
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
+from tabarena.models.fintfm.checkpoints import (
+    BINARY_CHECKPOINT,
+    MULTICLASS_CHECKPOINT_UNPUBLISHED,
+    REGRESSION_CHECKPOINT_UNPUBLISHED,
+)
 from tabarena.models.fintfm.model import FinTFMModel, prefetch_weights  # noqa: F401 (re-exported to info.py)
 
 if TYPE_CHECKING:
@@ -20,15 +23,15 @@ logger = logging.getLogger(__name__)
 TRAIN_SAMPLE_SIZE = 20_000
 #: Fewest probe rows a partition leaf is given, however small its share of the training rows.
 LEAF_MIN_SAMPLE = 2_000
-#: Keys ``FINTFM_PROBE`` accepts; see :meth:`FinTFMLinearProbeModel._probe_options`.
+#: Keys a probe option dict accepts; see :meth:`FinTFMLinearProbeModel._validated_probe`.
 PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head", "no_rep"})
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
     """fintfm, decided by a linear probe on its representation rather than its own head.
 
-    Exploratory sibling of :class:`~tabarena.models.fintfm.model.FinTFMModel`, not a
-    submission candidate. fintfm ``docs/results/FINDINGS.md`` §130/§131 measured that a plain
+    Sibling of :class:`~tabarena.models.fintfm.model.FinTFMModel` whose default config is the
+    measured TabArena-Lite entry (see ``_entry_*`` below). fintfm ``docs/results/FINDINGS.md`` §130/§131 measured that a plain
     ``LogisticRegression`` on the model's own pre-head representation beats its trained
     classification head on V4FinBench, 4 of 5 folds, +0.0214 mean AP, even though the probe
     reads the exact tensor the head itself reads (verified to reproduce the head's own logits
@@ -48,6 +51,38 @@ class FinTFMLinearProbeModel(FinTFMModel):
     ag_name = "FinTFM-LinProbe"
     ag_priority = 65
     seed_name = "random_state"
+
+    #: All three problem types, because the entry is measured on all three. The multiclass and
+    #: regression checkpoints are not published yet, so a fit on either raises
+    #: ``CheckpointNotPublishedError`` unless a local checkpoint is supplied.
+    _supported_problem_types: ClassVar[list[str]] = ["binary", "multiclass", "regression"]
+
+    #: The measured TabArena-Lite entry (fintfm ``docs/results/FINDINGS.md`` §232, §235, §237).
+    #: The default config reproduces it with no environment variable set:
+    #:
+    #: - binary, run ``fintfm_lp_bin_scalecvraw_1114``: the published checkpoint, partition ``{}``
+    #:   (the class defaults), probe ``scale`` + ``cv`` + ``raw``;
+    #: - multiclass, run ``fintfm_lp_mc_scr_bag8_1113``: partition ``n_bags`` 8, the same probe;
+    #: - regression, run ``fintfm_lp_reg_rawpart4_pure_1114``: partition ``n_bags`` 4, probe ``raw``,
+    #:   10 bins.
+    #:
+    #: All three use ``feature_transform`` ``squash`` and ``max_features_strategy`` ``select``.
+    _entry_params: ClassVar[dict] = {"feature_transform": "squash", "max_features_strategy": "select"}
+    _entry_checkpoint: ClassVar[dict] = {
+        "binary": BINARY_CHECKPOINT,
+        "multiclass": MULTICLASS_CHECKPOINT_UNPUBLISHED,
+        "regression": REGRESSION_CHECKPOINT_UNPUBLISHED,
+    }
+    _entry_partition: ClassVar[dict] = {"binary": {}, "multiclass": {"n_bags": 8}, "regression": {"n_bags": 4}}
+    _entry_probe: ClassVar[dict] = {
+        "binary": {"scale": True, "cv": True, "raw": True},
+        "multiclass": {"scale": True, "cv": True, "raw": True},
+        "regression": {"raw": True},
+    }
+    _per_problem_options: ClassVar[tuple[str, ...]] = ("checkpoint", "partition", "probe")
+
+    #: The probe options of the current fit, set by ``_fit``.
+    _probe_opts: dict = {}
 
     def _fit(
         self,
@@ -86,7 +121,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             self._fit_ridge_probe(np.asarray(Xp, dtype=np.float32), y_arr.astype(np.float64))
             return
         if hasattr(self.model, "trees_"):
-            # FINTFM_PARTITION wrapped the classifier: one probe per leaf context.
+            # The partition setting wrapped the classifier: one probe per leaf context.
             self._fit_leaf_probes(np.asarray(Xp, dtype=np.float32), y_arr)
             return
         self._leaf_probes = None
@@ -110,6 +145,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._fit_raw_conditioner(Xp)
         self._linear_probe = self._new_classifier_probe().fit(self._probe_input(self.model, Xp[sub]), y_sub)
 
+    def _resolve_entry(self, params: dict) -> dict:
+        """The base class's entry settings, with the probe validated and kept for fit and predict."""
+        entry = super()._resolve_entry(params)
+        self._probe_opts = entry["probe"] = self._validated_probe(entry["probe"], source=f"probe_{self.problem_type}")
+        return entry
+
     def _fit_ridge_probe(self, Xp: np.ndarray, y_arr: np.ndarray) -> None:
         """Fit a ridge readout on the binned regressor's pre-head representation.
 
@@ -120,7 +161,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         average of the bin representatives. Up to ``TRAIN_SAMPLE_SIZE`` training rows, drawn
         uniformly at random.
 
-        Under ``FINTFM_PARTITION`` the model is a ``PartitionedTFMRegressor``: the global
+        With a partition the model is a ``PartitionedTFMRegressor``: the global
         fallback regressor gets this probe, and every leaf with its own regressor gets a ridge
         probe of its own on the training rows routed to it, read through that leaf's
         classifier, with the row budget split as in :meth:`_fit_leaf_probes`.
@@ -136,7 +177,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._fit_raw_conditioner(Xp)
         self._ridge_leaf_probes = None
         if hasattr(self.model, "thresholds_"):
-            # FINTFM_REG_THRESHOLDS: the readout reads the K threshold logits, not a
+            # Threshold regression (FINTFM_REG_THRESHOLDS): the readout reads the K threshold logits, not a
             # representation, beside the raw features when the raw option is set.
             self._ridge_probe = self._fit_threshold_ridge(Xp, y_arr, seed)
             return
@@ -206,7 +247,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         rng = np.random.default_rng(seed)
         n = len(y_arr)
         sub = np.sort(rng.choice(n, size=TRAIN_SAMPLE_SIZE, replace=False)) if n > TRAIN_SAMPLE_SIZE else np.arange(n)
-        alphas = np.logspace(-3, 5, 17) if self._probe_options().get("raw") else np.logspace(-3, 3, 13)
+        alphas = np.logspace(-3, 5, 17) if self._probe_opts.get("raw") else np.logspace(-3, 3, 13)
         feats = self._threshold_input(Xp[sub])
         return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(feats, y_arr[sub])
 
@@ -234,7 +275,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         sub = members[np.sort(rng.choice(m, size=budget, replace=False))] if m > budget else members
         # A wider grid when raw columns join the representation: a 1,024-column table can need
         # far more shrinkage than the representation alone.
-        alphas = np.logspace(-3, 5, 17) if self._probe_options().get("raw") else np.logspace(-3, 3, 13)
+        alphas = np.logspace(-3, 5, 17) if self._probe_opts.get("raw") else np.logspace(-3, 3, 13)
         rep = self._probe_input(clf, Xp[sub])
         return make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
 
@@ -334,12 +375,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
         return probe.predict_proba(self._probe_input(est, X))
 
     @staticmethod
-    def _probe_options() -> dict:
-        """Readout options from ``FINTFM_PROBE``, a JSON object; empty when unset.
+    def _validated_probe(opts, *, source: str) -> dict:
+        """Check readout options; ``None`` or ``{}`` is the plain readout.
 
-        Unset, every readout is exactly the one the earlier runs used: a ``LogisticRegression``
-        at ``C=1`` on the raw representation, and a standardised ``RidgeCV`` for regression.
-        The keys, each a boolean:
+        The plain readout is a ``LogisticRegression`` at ``C=1`` on the raw representation, and
+        a standardised ``RidgeCV`` for regression. The keys, each a boolean:
 
         - ``scale``: standardise the probe's inputs before the logistic regression.
         - ``cv``: choose the logistic regression's ``C`` by 3-fold cross-validated log loss on
@@ -355,25 +395,27 @@ class FinTFMLinearProbeModel(FinTFMModel):
           alone, on the same leaves and rows: the matched raw-only control (fintfm FINDINGS
           §238). The network then only supplies the head for leaves whose probe is ``None``.
 
-        Like ``FINTFM_PARAMS``, the options do not change the config name, so a run that sets
-        them needs its own ``FINTFM_RUN_NAME``.
+        Args:
+            opts: The ``probe_<type>`` hyperparameter: ``None`` or a dict of the keys above.
+            source: Where the value came from, for the message.
 
         Returns:
-            The parsed options.
+            The options as a dict, empty for the plain readout.
 
         Raises:
-            ValueError: the value is not a JSON object, or names an unknown key.
+            ValueError: the value is not a dict, names an unknown key, or sets ``no_rep``
+                without ``raw``.
         """
-        raw = os.environ.get("FINTFM_PROBE", "").strip()
-        if not raw:
+        if opts is None:
             return {}
-        opts = json.loads(raw)
         if not isinstance(opts, dict):
-            raise ValueError(f"FINTFM_PROBE must be a JSON object, got {raw!r}")
+            raise ValueError(f"{source} must be a JSON object, got {opts!r}")
         unknown = set(opts) - PROBE_OPTIONS
         if unknown:
-            raise ValueError(f"FINTFM_PROBE has unknown key(s) {sorted(unknown)}; known: {sorted(PROBE_OPTIONS)}")
-        return opts
+            raise ValueError(f"{source} has unknown key(s) {sorted(unknown)}; known: {sorted(PROBE_OPTIONS)}")
+        if opts.get("no_rep") and not opts.get("raw"):
+            raise ValueError(f"{source}: no_rep needs raw, the readout would have no input")
+        return dict(opts)
 
     def _new_classifier_probe(self):
         """An unfitted classification readout, as :meth:`_probe_options` configures it.
@@ -386,7 +428,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         from sklearn.pipeline import make_pipeline
         from sklearn.preprocessing import StandardScaler
 
-        opts = self._probe_options()
+        opts = self._probe_opts
         if opts.get("cv"):
             probe = LogisticRegressionCV(Cs=np.logspace(-3, 2, 6), cv=3, scoring="neg_log_loss", max_iter=2000)
         else:
@@ -402,7 +444,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         from fintfm.inference.preprocess import FeatureConditioner
 
         self._raw_conditioner = None
-        if self._probe_options().get("raw"):
+        if self._probe_opts.get("raw"):
             self._raw_conditioner = FeatureConditioner("squash", random_state=int(self.random_seed)).fit(Xp)
 
     def _probe_input(self, est, X: np.ndarray) -> np.ndarray:
@@ -418,9 +460,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         """
         import numpy as np
 
-        opts = self._probe_options()
-        if opts.get("no_rep") and not opts.get("raw"):
-            raise ValueError("FINTFM_PROBE no_rep needs raw: the readout would have no input")
+        opts = self._probe_opts
         blocks = (
             []
             if opts.get("no_rep")
@@ -429,7 +469,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
             blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
-        if self._probe_options().get("head"):
+        if self._probe_opts.get("head"):
             if self.problem_type == "regression":
                 blocks.append(np.asarray(self.model.predict(X), dtype=np.float64).reshape(-1, 1))
             else:
