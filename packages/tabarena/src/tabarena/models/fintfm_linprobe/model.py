@@ -34,6 +34,8 @@ PROBE_OPTIONS = frozenset({"scale", "cv", "raw", "head", "no_rep"})
 #: (FinTFM-LinProbe, 932 Elo) was produced WITHOUT cross-fitting, so any figure from a run
 #: with this default is a new measurement; see :class:`FinTFMLinearProbeModel`.
 PROBE_CROSSFIT_FOLDS = 5
+#: Names ``probe_ensemble`` accepts; see :meth:`FinTFMLinearProbeModel._member_settings`.
+PROBE_ENSEMBLE_MEMBERS = ("xfit", "noxfit", "rawonly")
 #: Deepest tree ``fintfm.inference.large_n.PartitionedTFMClassifier`` and ``PartitionedTFMRegressor``
 #: accept (``max_depth`` is checked to lie in [1, 3]); ``partition_depth_cap`` is clipped to it.
 PARTITION_LIBRARY_MAX_DEPTH = 3
@@ -143,6 +145,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
     _crossfit_folds: int = 0
     #: Whether the readout of the current fit is cross-fitted.
     _crossfit_on: bool = False
+    #: Readout members of the current fit (``probe_ensemble``), ``None`` for the single readout.
+    _probe_ensemble: tuple[str, ...] | None = None
+    #: Fitted members, name to readout state, ``None`` for the single readout.
+    _ensemble_members: dict | None = None
+    #: Representations computed during one ensemble ``predict``, shared between members.
+    _rep_cache: dict | None = None
     #: The matrix the classifier was fitted on, held only while ``_fit`` builds the readout.
     _train_matrix = None
     #: Counters of the cross-fit work of the current fit, for the log line.
@@ -181,6 +189,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("partition_scale_k", PARTITION_SCALE_K)
         self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
         self._set_default_param_value("probe_budget", TRAIN_SAMPLE_SIZE)
+        self._set_default_param_value("probe_ensemble", None)
 
     @classmethod
     def _env_entry_overrides(cls) -> dict:
@@ -249,7 +258,46 @@ class FinTFMLinearProbeModel(FinTFMModel):
             value = budget if budget == "all" else cls._int_or_raise(budget, "FINTFM_PROBE_BUDGET")
             over["probe_budget"] = cls._check_probe_budget(value, source="FINTFM_PROBE_BUDGET")
             logger.warning("fintfm: probe budget %s (FINTFM_PROBE_BUDGET)", budget)
+        members = os.environ.get("FINTFM_PROBE_ENSEMBLE", "").strip().lower()
+        if members:
+            over["probe_ensemble"] = cls._check_probe_ensemble(
+                [m.strip() for m in members.split(",") if m.strip()], source="FINTFM_PROBE_ENSEMBLE"
+            )
+            logger.warning("fintfm: probe ensemble %s (FINTFM_PROBE_ENSEMBLE)", members)
         return over
+
+    @staticmethod
+    def _check_probe_ensemble(value, *, source: str) -> tuple[str, ...] | None:
+        """Validate a ``probe_ensemble`` setting.
+
+        Args:
+            value: ``None`` or an empty sequence (no ensemble), a comma-separated string, or a
+                sequence of member names from :data:`PROBE_ENSEMBLE_MEMBERS`.
+            source: Where the value came from, for the message.
+
+        Returns:
+            ``None`` for no ensemble, else the member names as a tuple, in the order given.
+
+        Raises:
+            ValueError: a name is unknown or repeated, or fewer than two members are given.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            value = [m.strip() for m in value.lower().split(",") if m.strip()]
+        if not isinstance(value, (list, tuple)):
+            raise ValueError(f"{source} must be a list of member names, got {value!r}")
+        if len(value) == 0:
+            return None
+        names = tuple(value)
+        unknown = [m for m in names if m not in PROBE_ENSEMBLE_MEMBERS]
+        if unknown:
+            raise ValueError(f"{source} has unknown member(s) {unknown}; known: {list(PROBE_ENSEMBLE_MEMBERS)}")
+        if len(set(names)) != len(names):
+            raise ValueError(f"{source} repeats a member: {list(names)}")
+        if len(names) < 2:
+            raise ValueError(f"{source} needs at least two members to average, got {list(names)}")
+        return names
 
     @staticmethod
     def _int_or_raise(text: str, name: str) -> int:
@@ -459,6 +507,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             # then refuses the wider table (Bioresponse on TabArena-Lite, 2026-11-11).
             Xp = self.preprocess(X, is_train=False)
         self._crossfit_on = crossfit
+        self._ensemble_members = None
         y_arr = np.asarray(y)
         self._ridge_probe = None
         if self.problem_type == "regression":
@@ -476,6 +525,23 @@ class FinTFMLinearProbeModel(FinTFMModel):
             self._finish_reg_levers()
             self._log_crossfit()
             return
+        if self._probe_ensemble:
+            self._fit_probe_ensemble(X, y_arr, train_matrix)
+            return
+        self._fit_classifier_readout(Xp, y_arr, crossfit)
+
+    def _fit_classifier_readout(self, Xp: np.ndarray, y_arr: np.ndarray, crossfit: bool) -> None:
+        """Fit the classification readout under the current probe options.
+
+        Sets ``_leaf_probes``, ``_linear_probe`` and ``_raw_conditioner``.
+
+        Args:
+            Xp: Preprocessed training matrix.
+            y_arr: Training labels in the original class order.
+            crossfit: Whether the readout rows' representations are cross-fitted.
+        """
+        import numpy as np
+
         if hasattr(self.model, "trees_"):
             # The partition setting wrapped the classifier: one probe per leaf context.
             self._fit_leaf_probes(np.asarray(Xp, dtype=np.float32), y_arr)
@@ -507,6 +573,87 @@ class FinTFMLinearProbeModel(FinTFMModel):
         )
         self._log_crossfit()
 
+    #: Attributes that make up one readout; a member is a snapshot of them.
+    _READOUT_STATE: ClassVar[tuple[str, ...]] = (
+        "_probe_opts",
+        "_crossfit_on",
+        "_raw_conditioner",
+        "_linear_probe",
+        "_leaf_probes",
+    )
+
+    def _member_settings(self, name: str, base: dict) -> tuple[dict, bool]:
+        """Probe options and cross-fit flag of one ensemble member.
+
+        - ``xfit``: the configured readout, cross-fitted (``probe_crossfit_folds`` folds).
+        - ``noxfit``: the same readout with no cross-fitting: representations of the readout rows
+          under the full context, on the matrix replayed with ``is_train=False``.
+        - ``rawonly``: the matched raw-only control: ``raw`` and ``no_rep`` set on the
+          configured options, fitted on the training matrix like ``xfit``. The readout input is
+          the squashed features alone, so it needs no representation pass.
+
+        Args:
+            name: A member of :data:`PROBE_ENSEMBLE_MEMBERS`.
+            base: The validated probe options of the fit.
+
+        Returns:
+            ``(options, crossfit)``.
+        """
+        if name == "xfit":
+            return dict(base), True
+        if name == "noxfit":
+            return dict(base), False
+        return {**base, "raw": True, "no_rep": True}, True
+
+    def _fit_probe_ensemble(self, X: pd.DataFrame, y_arr: np.ndarray, train_matrix) -> None:
+        """Fit every ``probe_ensemble`` member on the one fitted network and keep their states.
+
+        The network (context storage) is fitted once by the parent ``_fit``; members differ only
+        in the readout. Each member is fitted by :meth:`_fit_classifier_readout` under its own
+        options, and its state is snapshotted so :meth:`_predict_proba` can restore it.
+
+        Args:
+            X: Training features, replayed through ``preprocess`` for members that do not cross-fit.
+            y_arr: Training labels in the original class order.
+            train_matrix: The matrix the classifier was fitted on (out-of-fold encoding).
+        """
+        base = dict(self._probe_opts)
+        members: dict = {}
+        for name in self._probe_ensemble or ():
+            opts, crossfit = self._member_settings(name, base)
+            self._probe_opts, self._crossfit_on = opts, crossfit
+            self._crossfit_stats = {"restricted": 0, "context_rows": 0, "other_rows": 0, "skipped": 0}
+            Xp = train_matrix if crossfit else self.preprocess(X, is_train=False)
+            logger.warning("FinTFM-LinProbe: fitting ensemble member %s.", name)
+            self._fit_classifier_readout(Xp, y_arr, crossfit)
+            members[name] = {k: getattr(self, k) for k in self._READOUT_STATE}
+        self._ensemble_members = members
+        self._set_readout_state(members[self._probe_ensemble[0]])
+
+    def _set_readout_state(self, state: dict) -> None:
+        """Make a member's snapshot the current readout."""
+        for key, value in state.items():
+            setattr(self, key, value)
+
+    def _predict_proba_ensemble(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
+        """Equal-weight mean of the members' predicted probabilities.
+
+        Each member is scored by the single-readout path under its own state. The network's
+        full-context representation of a given batch is computed once and shared by the members
+        that read it (``xfit`` and ``noxfit``).
+        """
+        import numpy as np
+
+        self._rep_cache = {}
+        try:
+            outs = []
+            for state in (self._ensemble_members or {}).values():
+                self._set_readout_state(state)
+                outs.append(np.asarray(self._predict_proba_single(X, **kwargs), dtype=np.float64))
+        finally:
+            self._rep_cache = None
+        return np.mean(outs, axis=0)
+
     def _resolve_entry(self, params: dict) -> dict:
         """The base class's entry settings, with the probe validated and kept for fit and predict.
 
@@ -521,6 +668,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         folds = params.pop("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
         if isinstance(folds, bool) or not isinstance(folds, int) or folds < 0:
             raise ValueError(f"probe_crossfit_folds must be a non-negative integer, got {folds!r}")
+        ensemble = self._check_probe_ensemble(params.pop("probe_ensemble", None), source="probe_ensemble")
         entry = super()._resolve_entry(params)
         entry["partition"] = self._scaled_partition(entry["partition"])
         self._probe_opts = entry["probe"] = self._validated_probe(entry["probe"], source=f"probe_{self.problem_type}")
@@ -530,6 +678,14 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 "is not cross-fitted; set probe_crossfit_folds to 0 to use it"
             )
         self._crossfit_folds = folds
+        if ensemble is not None:
+            if self.problem_type == "regression":
+                raise ValueError("probe_ensemble is for classification; regression has no ensemble readout")
+            if folds < 2:
+                raise ValueError("probe_ensemble needs probe_crossfit_folds >= 2 for its cross-fitted members")
+            if self._probe_opts.get("head") or self._probe_opts.get("no_rep"):
+                raise ValueError("probe_ensemble sets 'no_rep' itself and does not combine with 'head'")
+        self._probe_ensemble = ensemble
         return entry
 
     def _apply_target_transform(self, y):
@@ -1195,7 +1351,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         elif fit_idx is not None:
             blocks = [self._crossfit_representation(est, X, fit_idx)]
         else:
-            blocks = [np.asarray(est.transform_representation(X, stage="pre_head"), dtype=np.float64)]
+            blocks = [self._full_context_representation(est, X)]
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
             blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
@@ -1206,7 +1362,36 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 blocks.append(np.log(np.clip(np.asarray(est.predict_proba(X), dtype=np.float64), 1e-6, 1.0)))
         return blocks[0] if len(blocks) == 1 else np.hstack(blocks)
 
+    def _full_context_representation(self, est, X: np.ndarray) -> np.ndarray:
+        """Pre-head representation of ``X`` under ``est``'s full context, shared inside an ensemble predict.
+
+        Outside an ensemble predict (``_rep_cache`` is ``None``) this is a plain pass. Inside one,
+        a batch already represented by the same network is returned from the cache, keyed by the
+        estimator and a hash of the batch bytes.
+        """
+        import hashlib
+
+        import numpy as np
+
+        def compute() -> np.ndarray:
+            return np.asarray(est.transform_representation(X, stage="pre_head"), dtype=np.float64)
+
+        cache = self._rep_cache
+        if cache is None:
+            return compute()
+        arr = np.ascontiguousarray(X)
+        key = (id(est), arr.shape, str(arr.dtype), hashlib.blake2b(arr.tobytes(), digest_size=16).digest())
+        if key not in cache:
+            cache[key] = compute()
+        return cache[key]
+
     def _predict_proba(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
+        if getattr(self, "_ensemble_members", None):
+            return self._predict_proba_ensemble(X, **kwargs)
+        return self._predict_proba_single(X, **kwargs)
+
+    def _predict_proba_single(self, X: pd.DataFrame, **kwargs) -> np.ndarray:
+        """Predicted probabilities (or values) of the current single readout state."""
         import numpy as np
 
         if getattr(self, "_ridge_probe", None) is not None:
