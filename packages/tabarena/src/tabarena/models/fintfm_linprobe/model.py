@@ -42,6 +42,8 @@ PARTITION_SCALE_K = 4.0
 PARTITION_DEPTH_CAP = 5
 #: The alpha grid ``reg_ridge_alphas="wide"`` names.
 WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
+#: Values of ``reg_readout``: the linear ridge, or ridge on random Fourier features.
+REG_READOUTS = ("ridge", "rff")
 
 
 class FinTFMLinearProbeModel(FinTFMModel):
@@ -151,6 +153,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
     _reg_transform_name: str = "none"
     _reg_blend = None
     _reg_alphas = None
+    _reg_readout: str = "ridge"
     #: Training rows of the current fit, read by :meth:`_resolve_entry` for the depth scaling.
     _n_fit_rows: int | None = None
     #: Large-table levers of the current fit, set by :meth:`_resolve_entry`.
@@ -177,6 +180,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("reg_target_transform", "none")
         self._set_default_param_value("reg_readout_blend", None)
         self._set_default_param_value("reg_ridge_alphas", None)
+        self._set_default_param_value("reg_readout", "ridge")
         self._set_default_param_value("partition_scale_with_n", False)
         self._set_default_param_value("partition_scale_k", PARTITION_SCALE_K)
         self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
@@ -191,6 +195,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
           the ridge); ``none`` or ``off`` leaves it off.
         - ``FINTFM_REG_ALPHAS``: ``reg_ridge_alphas``, a JSON list of positive numbers, ``wide``, or
           ``logspace:lo,hi,n`` (exponents of 10).
+        - ``FINTFM_REG_READOUT``: ``reg_readout``, ``ridge`` (default) or ``rff`` (ridge on random
+          Fourier features, bandwidth and alpha chosen by inner CV on the training rows).
         - ``FINTFM_PARTITION_SCALE_N``: ``partition_scale_with_n``; ``on``/``true`` enables with the default k,
           ``off``/``false`` disables, a positive number enables and sets ``partition_scale_k``.
         - ``FINTFM_PROBE_BUDGET``: ``probe_budget``, a positive integer or ``all``.
@@ -228,6 +234,10 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     raise ValueError(f"FINTFM_REG_ALPHAS is not valid JSON: {exc}") from exc
             over["reg_ridge_alphas"] = cls._check_reg_alphas(value, source="FINTFM_REG_ALPHAS")
             logger.warning("fintfm: regression ridge alphas set by FINTFM_REG_ALPHAS")
+        readout = os.environ.get("FINTFM_REG_READOUT", "").strip().lower()
+        if readout:
+            over["reg_readout"] = cls._check_reg_readout(readout, source="FINTFM_REG_READOUT")
+            logger.warning("fintfm: regression readout %s (FINTFM_REG_READOUT)", readout)
         scale = os.environ.get("FINTFM_PARTITION_SCALE_N", "").strip().lower()
         if scale:
             if scale in ("on", "true", "yes"):
@@ -366,6 +376,14 @@ class FinTFMLinearProbeModel(FinTFMModel):
         return float(value)
 
     @staticmethod
+    def _check_reg_readout(value, *, source: str) -> str:
+        if value is None:
+            return "ridge"
+        if value not in REG_READOUTS:
+            raise ValueError(f"{source} must be one of {REG_READOUTS}, got {value!r}")
+        return value
+
+    @staticmethod
     def _check_reg_alphas(value, *, source: str):
         if value is None or value == "wide":
             return value
@@ -394,6 +412,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         )
         self._reg_blend = self._check_reg_blend(get("reg_readout_blend", None), source="reg_readout_blend")
         self._reg_alphas = self._check_reg_alphas(get("reg_ridge_alphas", None), source="reg_ridge_alphas")
+        self._reg_readout = self._check_reg_readout(get("reg_readout", "ridge"), source="reg_readout")
         folds = params.get("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
         if self._reg_blend == "cv" and not (isinstance(folds, int) and folds >= 2):
             raise ValueError("reg_readout_blend='cv' needs probe_crossfit_folds >= 2 for out-of-fold head predictions")
@@ -836,7 +855,13 @@ class FinTFMLinearProbeModel(FinTFMModel):
         alphas = self._alpha_grid()
         fit_idx = None if fit_rows is None else _positions_in(fit_rows, sub)
         rep = self._probe_input(clf, Xp[sub], fit_idx)
-        pipe = make_pipeline(StandardScaler(), RidgeCV(alphas=alphas)).fit(rep, y_arr[sub])
+        if self._reg_readout == "rff":
+            from tabarena.models.fintfm_linprobe.rff import RFFRidgeCV
+
+            head = RFFRidgeCV(alphas=alphas, random_state=seed)
+        else:
+            head = RidgeCV(alphas=alphas)
+        pipe = make_pipeline(StandardScaler(), head).fit(rep, y_arr[sub])
         if self._reg_blend == "cv" or (self._target_tf is not None and self._target_tf.name == "log1p"):
             self._collect_oof(pipe, rep, y_arr[sub], clf, binner, Xp[sub], fit_idx)
         return pipe
