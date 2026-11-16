@@ -55,6 +55,8 @@ ONEHOT_MAX_COLUMNS = 256
 #: the B-spline degree.
 SPLINE_N_KNOTS = 5
 SPLINE_DEGREE = 3
+#: Default ``max_columns`` of ``probe_spline``: the most numeric columns that are expanded.
+SPLINE_MAX_COLUMNS = 64
 #: The alpha grid ``reg_ridge_alphas="wide"`` names.
 WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
 #: Values of ``reg_readout``: the linear ridge, or ridge on random Fourier features.
@@ -255,8 +257,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
           ``ONEHOT_MIN_COUNT`` rows, at most ``ONEHOT_MAX_COLUMNS`` columns), ``off``, or a JSON object
           ``{"min_count": int, "max_columns": int}``. Multiclass only; see :meth:`_check_onehot`.
         - ``FINTFM_PROBE_SPLINE``: ``probe_spline``, ``on`` (defaults: ``SPLINE_N_KNOTS`` knots,
-          degree ``SPLINE_DEGREE``), ``off`` or empty, or a JSON object ``{"n_knots": int, "degree": int}``
-          (``n_knots`` >= 3, ``degree`` in 1..3). Needs the ``raw`` probe option; see :meth:`_check_spline`.
+          degree ``SPLINE_DEGREE``, ``SPLINE_MAX_COLUMNS`` columns), ``off`` or empty, or a JSON object
+          ``{"n_knots": int, "degree": int, "max_columns": int}`` (``n_knots`` >= 3, ``degree`` in 1..3,
+          ``max_columns`` >= 1). Needs the ``raw`` probe option; see :meth:`_check_spline`.
 
         Returns:
             The overrides; empty when no variable is set.
@@ -369,11 +372,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         Args:
             value: ``None``/``False`` (off), ``True`` (defaults) or a dict with the optional keys
                 ``n_knots`` (an int >= 3: knots per numeric column, at training-row quantiles) and
-                ``degree`` (an int in 1..3: the B-spline degree).
+                ``degree`` (an int in 1..3: the B-spline degree) and ``max_columns`` (an int >= 1:
+                the most numeric columns expanded; see :meth:`_fit_raw_spline`).
             source: Where the value came from, for the error message.
 
         Returns:
-            ``None`` for off, else ``{"n_knots": int, "degree": int}``.
+            ``None`` for off, else ``{"n_knots": int, "degree": int, "max_columns": int}``.
 
         Raises:
             ValueError: the value is of another type, names an unknown key, ``n_knots`` is below
@@ -381,7 +385,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         """
         if value is None or value is False:
             return None
-        cfg = {"n_knots": SPLINE_N_KNOTS, "degree": SPLINE_DEGREE}
+        cfg = {"n_knots": SPLINE_N_KNOTS, "degree": SPLINE_DEGREE, "max_columns": SPLINE_MAX_COLUMNS}
         if value is True:
             return cfg
         if not isinstance(value, dict):
@@ -389,7 +393,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         unknown = set(value) - set(cfg)
         if unknown:
             raise ValueError(f"{source} has unknown key(s) {sorted(unknown)}; known: {sorted(cfg)}")
-        bounds = {"n_knots": (3, None), "degree": (1, 3)}
+        bounds = {"n_knots": (3, None), "degree": (1, 3), "max_columns": (1, None)}
         for key, v in value.items():
             lo, hi = bounds[key]
             if isinstance(v, bool) or not isinstance(v, int) or v < lo or (hi is not None and v > hi):
@@ -1788,10 +1792,17 @@ class FinTFMLinearProbeModel(FinTFMModel):
         ensemble member) gets a fit of its own. A numeric column is expanded when its
         ``n_knots`` quantile knots are all distinct; a column with fewer distinct knot positions
         (a constant, a binary indicator, a column that is mostly one value) is left as it is,
-        because tied quantile knots give degenerate basis functions. Categorical columns (their
+        because tied quantile knots give degenerate basis functions. When more than
+        ``max_columns`` columns qualify, only the ``max_columns`` with the most distinct training
+        values are expanded (ties: lower column index first) and the rest pass through unchanged;
+        this bounds the readout width on wide tables. The choice reads X only, never the labels.
+        Categorical columns (their
         encoded values, see :meth:`_categorical_columns`) are never expanded. The squash
         bounds each column, so the linear extrapolation of a query value outside the training
         range stays bounded too.
+
+        The transformer reads X only, never the labels, so sharing one across the cross-fit
+        folds and partition leaves of a readout leaks no label information.
 
         Args:
             Z: The squashed, finite training matrix, ``(n, d)``.
@@ -1811,12 +1822,22 @@ class FinTFMLinearProbeModel(FinTFMModel):
         ]
         if not sel:
             return None
+        n_qualify = len(sel)
+        cap = cfg["max_columns"]
+        if n_qualify > cap:
+            distinct = {j: np.unique(Z[:, j]).size for j in sel}
+            sel = sorted(sorted(sel, key=lambda j: (-distinct[j], j))[:cap])
         sel_arr = np.array(sel, dtype=np.intp)
         keep = np.setdiff1d(np.arange(Z.shape[1]), sel_arr).astype(np.intp)
         tf = SplineTransformer(
             n_knots=n_knots, degree=degree, knots="quantile", extrapolation="linear", include_bias=False
         ).fit(Z[:, sel_arr])
-        logger.warning("FinTFM-LinProbe: probe_spline expands %d of %d raw columns.", len(sel), Z.shape[1])
+        logger.warning(
+            "FinTFM-LinProbe: probe_spline expands %d of %d raw columns%s.",
+            len(sel),
+            Z.shape[1],
+            f" ({n_qualify} qualified; max_columns={cap} bound)" if n_qualify > cap else "",
+        )
         return {"keep": keep, "sel": sel_arr, "tf": tf}
 
     def _raw_block(self, X: np.ndarray) -> np.ndarray:

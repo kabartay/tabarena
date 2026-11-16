@@ -13,7 +13,12 @@ pytest.importorskip("torch")
 
 from sklearn.preprocessing import SplineTransformer
 
-from tabarena.models.fintfm_linprobe.model import SPLINE_DEGREE, SPLINE_N_KNOTS, FinTFMLinearProbeModel
+from tabarena.models.fintfm_linprobe.model import (
+    SPLINE_DEGREE,
+    SPLINE_MAX_COLUMNS,
+    SPLINE_N_KNOTS,
+    FinTFMLinearProbeModel,
+)
 from tabarena.models.fintfm_linprobe.tests.test_crossfit import (  # noqa: F401 (fixtures)
     N_TRAIN,
     PARTITION,
@@ -63,7 +68,7 @@ def test_default_off_is_bit_identical(tmp_path, checkpoint):
 @pytest.mark.parametrize("categorical", [False, True])
 def test_on_fits_and_predicts(problem_type, categorical, tmp_path, checkpoint):
     m, _, X_test = fitted(tmp_path, checkpoint, problem_type, categorical=categorical, probe_spline=True)
-    assert m._spline_cfg == {"n_knots": SPLINE_N_KNOTS, "degree": SPLINE_DEGREE}
+    assert m._spline_cfg == {"n_knots": SPLINE_N_KNOTS, "degree": SPLINE_DEGREE, "max_columns": SPLINE_MAX_COLUMNS}
     assert m._raw_spline is not None
     out = predict(m, X_test)
     assert np.isfinite(out).all()
@@ -211,7 +216,13 @@ def test_env_parsing(monkeypatch):
     monkeypatch.setenv("FINTFM_PROBE_SPLINE", '{"n_knots": 7, "degree": 2}')
     assert over()["probe_spline"] == {"n_knots": 7, "degree": 2}
     monkeypatch.setenv("FINTFM_PROBE_SPLINE", '{"n_knots": 7}')
-    assert FinTFMLinearProbeModel._check_spline(over()["probe_spline"], source="t") == {"n_knots": 7, "degree": 3}
+    assert FinTFMLinearProbeModel._check_spline(over()["probe_spline"], source="t") == {
+        "n_knots": 7,
+        "degree": 3,
+        "max_columns": SPLINE_MAX_COLUMNS,
+    }
+    monkeypatch.setenv("FINTFM_PROBE_SPLINE", '{"max_columns": 12}')
+    assert over()["probe_spline"] == {"max_columns": 12}
 
 
 @pytest.mark.parametrize(
@@ -228,6 +239,9 @@ def test_env_parsing(monkeypatch):
         '{"degree": 0}',
         '{"degree": 4}',
         '{"degree": "3"}',
+        '{"max_columns": 0}',
+        '{"max_columns": 2.5}',
+        '{"max_columns": true}',
     ],
 )
 def test_env_invalid_values_are_errors(text, monkeypatch):
@@ -246,7 +260,7 @@ def test_hyperparameter_validation(tmp_path, checkpoint):
 def test_env_variable_reaches_the_fit(tmp_path, checkpoint, monkeypatch):
     monkeypatch.setenv("FINTFM_PROBE_SPLINE", '{"n_knots": 4, "degree": 1}')
     m, _, _ = fitted(tmp_path, checkpoint)
-    assert m._spline_cfg == {"n_knots": 4, "degree": 1}
+    assert m._spline_cfg == {"n_knots": 4, "degree": 1, "max_columns": SPLINE_MAX_COLUMNS}
 
 
 def test_moot_without_the_raw_block(tmp_path, checkpoint):
@@ -255,3 +269,32 @@ def test_moot_without_the_raw_block(tmp_path, checkpoint):
     assert on._spline_cfg is None
     assert on._raw_spline is None
     assert np.array_equal(predict(base, X_test), predict(on, X_test))
+
+
+def test_max_columns_binds_by_distinct_count_then_column_index(tmp_path, checkpoint):
+    X, y, X_test = data("binary")
+    X, X_test = X.copy(), X_test.copy()
+    # Distinct training values: f0..f4 have 240 each (ties); the two coarse columns have 8 and 6.
+    for frame in (X, X_test):
+        frame["coarse8"] = np.round(frame["f0"] * 2).clip(-4, 3)
+        frame["coarse6"] = np.round(frame["f1"] * 2).clip(-3, 2)
+    assert X["coarse8"].nunique() == 8
+    assert X["coarse6"].nunique() == 6
+    m = make("binary", tmp_path, checkpoint, probe_binary=PROBE, probe_spline={"max_columns": 3})
+    m.fit(X=X, y=y)
+    # All seven qualify; the five 240-value columns win on count, the three lowest indices on the tie.
+    assert m._raw_spline["sel"].tolist() == [0, 1, 2]
+    assert m._raw_spline["keep"].tolist() == [3, 4, 5, 6]
+    assert np.isfinite(predict(m, X_test)).all()
+    # A cap of 6 takes all five fine columns plus the 8-value one, not the 6-value one.
+    m6 = make("binary", tmp_path / "b", checkpoint, probe_binary=PROBE, probe_spline={"max_columns": 6})
+    m6.fit(X=X, y=y)
+    assert m6._raw_spline["sel"].tolist() == [0, 1, 2, 3, 4, 5]
+    assert m6._raw_spline["keep"].tolist() == [6]
+
+
+def test_cap_not_binding_changes_nothing(tmp_path, checkpoint):
+    a, _, X_test = fitted(tmp_path / "a", checkpoint, probe_spline=True)
+    b, _, _ = fitted(tmp_path / "b", checkpoint, probe_spline={"max_columns": 5})
+    assert a._raw_spline["sel"].tolist() == b._raw_spline["sel"].tolist() == [0, 1, 2, 3, 4]
+    assert np.array_equal(predict(a, X_test), predict(b, X_test))
