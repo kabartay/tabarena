@@ -51,6 +51,10 @@ PARTITION_DEPTH_CAP = 5
 #: indicator column, and at most ``max_columns`` indicator columns are added in total.
 ONEHOT_MIN_COUNT = 3
 ONEHOT_MAX_COLUMNS = 256
+#: Defaults of ``probe_spline``: knots per numeric column (placed at training-row quantiles) and
+#: the B-spline degree.
+SPLINE_N_KNOTS = 5
+SPLINE_DEGREE = 3
 #: The alpha grid ``reg_ridge_alphas="wide"`` names.
 WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
 #: Values of ``reg_readout``: the linear ridge, or ridge on random Fourier features.
@@ -193,6 +197,15 @@ class FinTFMLinearProbeModel(FinTFMModel):
     #: The fitted indicator columns ``(column index among the categoricals, level code)`` as two
     #: arrays, or ``None`` when none were made (off, or no categorical columns).
     _oh_spec: tuple | None = None
+    #: ``probe_spline`` of the current fit as ``{"n_knots", "degree"}``, or ``None`` (off or moot).
+    _spline_cfg: dict | None = None
+    #: Positions of the categorical columns in the preprocessed matrix, recorded on the training
+    #: rows while ``probe_spline`` is on (``None`` otherwise); these columns are never splined.
+    _cat_cols: np.ndarray | None = None
+    #: The fitted spline stage of the raw block, or ``None`` (off). ``{"keep", "sel", "tf"}``: the
+    #: columns passed through as they are, the columns expanded, and the fitted
+    #: ``SplineTransformer`` of the latter. Holds knot positions and coefficients only.
+    _raw_spline: dict | None = None
     #: The fitted target transform, or ``None`` when none is applied.
     _target_tf: TargetTransform | None = None
     #: What the transform did: requested name, effective name, and the reason for a fallback.
@@ -218,6 +231,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("probe_prob_floor", None)
         self._set_default_param_value("probe_ensemble", None)
         self._set_default_param_value("probe_onehot", None)
+        self._set_default_param_value("probe_spline", None)
 
     @classmethod
     def _env_entry_overrides(cls) -> dict:
@@ -240,6 +254,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
         - ``FINTFM_PROBE_ONEHOT``: ``probe_onehot``, ``on`` (defaults: levels with at least
           ``ONEHOT_MIN_COUNT`` rows, at most ``ONEHOT_MAX_COLUMNS`` columns), ``off``, or a JSON object
           ``{"min_count": int, "max_columns": int}``. Multiclass only; see :meth:`_check_onehot`.
+        - ``FINTFM_PROBE_SPLINE``: ``probe_spline``, ``on`` (defaults: ``SPLINE_N_KNOTS`` knots,
+          degree ``SPLINE_DEGREE``), ``off`` or empty, or a JSON object ``{"n_knots": int, "degree": int}``
+          (``n_knots`` >= 3, ``degree`` in 1..3). Needs the ``raw`` probe option; see :meth:`_check_spline`.
 
         Returns:
             The overrides; empty when no variable is set.
@@ -329,7 +346,57 @@ class FinTFMLinearProbeModel(FinTFMModel):
             cls._check_onehot(value, source="FINTFM_PROBE_ONEHOT")
             over["probe_onehot"] = value
             logger.warning("fintfm: one-hot categorical indicators in the readout %s (FINTFM_PROBE_ONEHOT)", onehot)
+        spline = os.environ.get("FINTFM_PROBE_SPLINE", "").strip()
+        if spline and spline.lower() not in ("none", "off", "false", "no"):
+            if spline.lower() in ("on", "true", "yes"):
+                value = True
+            else:
+                try:
+                    value = json.loads(spline)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"FINTFM_PROBE_SPLINE must be on, off or a JSON object: {exc}") from exc
+            cls._check_spline(value, source="FINTFM_PROBE_SPLINE")
+            over["probe_spline"] = value
+            logger.warning(
+                "fintfm: spline expansion of the numeric raw columns in the readout %s (FINTFM_PROBE_SPLINE)", spline
+            )
         return over
+
+    @staticmethod
+    def _check_spline(value, *, source: str) -> dict | None:
+        """Validate a ``probe_spline`` value and resolve it to its settings.
+
+        Args:
+            value: ``None``/``False`` (off), ``True`` (defaults) or a dict with the optional keys
+                ``n_knots`` (an int >= 3: knots per numeric column, at training-row quantiles) and
+                ``degree`` (an int in 1..3: the B-spline degree).
+            source: Where the value came from, for the error message.
+
+        Returns:
+            ``None`` for off, else ``{"n_knots": int, "degree": int}``.
+
+        Raises:
+            ValueError: the value is of another type, names an unknown key, ``n_knots`` is below
+                3 or ``degree`` is outside 1..3.
+        """
+        if value is None or value is False:
+            return None
+        cfg = {"n_knots": SPLINE_N_KNOTS, "degree": SPLINE_DEGREE}
+        if value is True:
+            return cfg
+        if not isinstance(value, dict):
+            raise ValueError(f"{source} must be true, false or a JSON object, got {value!r}")
+        unknown = set(value) - set(cfg)
+        if unknown:
+            raise ValueError(f"{source} has unknown key(s) {sorted(unknown)}; known: {sorted(cfg)}")
+        bounds = {"n_knots": (3, None), "degree": (1, 3)}
+        for key, v in value.items():
+            lo, hi = bounds[key]
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo or (hi is not None and v > hi):
+                want = f">= {lo}" if hi is None else f"in {lo}..{hi}"
+                raise ValueError(f"{source}: {key} must be an integer {want}, got {v!r}")
+            cfg[key] = v
+        return cfg
 
     @staticmethod
     def _check_onehot(value, *, source: str) -> dict | None:
@@ -711,6 +778,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         "_probe_opts",
         "_crossfit_on",
         "_raw_conditioner",
+        "_raw_spline",
         "_linear_probe",
         "_leaf_probes",
     )
@@ -829,7 +897,29 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 raise ValueError("probe_ensemble does not combine with probe_prob_floor")
         self._probe_ensemble = ensemble
         self._onehot_cfg = self._resolve_onehot(params.pop("probe_onehot", None))
+        self._spline_cfg = self._resolve_spline(params.pop("probe_spline", None))
         return entry
+
+    def _resolve_spline(self, value) -> dict | None:
+        """The ``probe_spline`` settings that apply to this fit, ``None`` when it is off or moot.
+
+        The spline features replace numeric columns of the ``raw`` block, so without that probe
+        option there is nothing to expand and a request is ignored with a warning. It applies to
+        binary, multiclass and regression readouts alike.
+
+        Args:
+            value: The ``probe_spline`` hyperparameter.
+
+        Returns:
+            The settings from :meth:`_check_spline`, or ``None``.
+        """
+        cfg = self._check_spline(value, source="probe_spline")
+        if cfg is None:
+            return None
+        if not self._probe_opts.get("raw"):
+            logger.warning("FinTFM-LinProbe: probe_spline ignored, it needs the 'raw' probe option.")
+            return None
+        return cfg
 
     def _resolve_onehot(self, value) -> dict | None:
         """The ``probe_onehot`` settings that apply to this fit, ``None`` when it is off or moot.
@@ -880,6 +970,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
         from autogluon.core.models import AbstractModel
 
         arr = super()._preprocess(X, y=y, is_train=is_train, **kwargs)
+        if is_train and self._spline_cfg is not None:
+            self._cat_cols = self._categorical_columns(X, **kwargs)
         cfg = self._onehot_cfg
         if cfg is None:
             return arr
@@ -895,6 +987,24 @@ class FinTFMLinearProbeModel(FinTFMModel):
             return arr
         cols, levels = self._oh_spec
         return _AugmentedMatrix.attach(arr, (codes[:, cols] == levels[None, :]).astype(np.float32))
+
+    def _categorical_columns(self, X, **kwargs) -> np.ndarray:
+        """Positions of the categorical columns in the matrix :meth:`_preprocess` returns.
+
+        Args:
+            X: The training frame.
+            **kwargs: Passed on to AutoGluon's own preprocessing.
+
+        Returns:
+            Sorted column positions; empty when the table has no categorical column.
+        """
+        from autogluon.core.models import AbstractModel
+
+        gen = self._feature_generator
+        if gen is None or not gen.features_in:
+            return np.zeros(0, dtype=np.intp)
+        frame = AbstractModel._preprocess(self, X, **kwargs)
+        return np.sort(np.array([frame.columns.get_loc(c) for c in gen.features_in], dtype=np.intp))
 
     @staticmethod
     def _choose_indicators(codes: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray] | None:
@@ -1155,7 +1265,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         blocks = [self.model.readout_features(X)]
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
-            blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
+            blocks.append(self._raw_block(X))
         return blocks[0] if len(blocks) == 1 else np.hstack(blocks)
 
     def _fit_threshold_ridge(self, Xp: np.ndarray, y_arr: np.ndarray, seed: int):
@@ -1659,8 +1769,71 @@ class FinTFMLinearProbeModel(FinTFMModel):
         from fintfm.inference.preprocess import FeatureConditioner
 
         self._raw_conditioner = None
+        self._raw_spline = None
         if self._probe_opts.get("raw"):
             self._raw_conditioner = FeatureConditioner("squash", random_state=int(self.random_seed)).fit(Xp)
+            if self._spline_cfg is not None:
+                self._raw_spline = self._fit_raw_spline(self._conditioned(self._raw_conditioner, Xp))
+
+    @staticmethod
+    def _conditioned(cond, X: np.ndarray) -> np.ndarray:
+        """``X`` squashed by the fitted raw conditioner, missing and infinite values made finite."""
+        return np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64)
+
+    def _fit_raw_spline(self, Z: np.ndarray) -> dict | None:
+        """Fit the spline stage of the raw block on the squashed training rows ``Z``.
+
+        Called only from :meth:`_fit_raw_conditioner`, so it sees exactly the rows the raw
+        conditioner is fitted on (training rows; never a query row) and every readout (each
+        ensemble member) gets a fit of its own. A numeric column is expanded when its
+        ``n_knots`` quantile knots are all distinct; a column with fewer distinct knot positions
+        (a constant, a binary indicator, a column that is mostly one value) is left as it is,
+        because tied quantile knots give degenerate basis functions. Categorical columns (their
+        encoded values, see :meth:`_categorical_columns`) are never expanded. The squash
+        bounds each column, so the linear extrapolation of a query value outside the training
+        range stays bounded too.
+
+        Args:
+            Z: The squashed, finite training matrix, ``(n, d)``.
+
+        Returns:
+            ``{"keep": columns passed through, "sel": columns expanded, "tf": SplineTransformer}``
+            or ``None`` when no column qualifies.
+        """
+        from sklearn.preprocessing import SplineTransformer
+
+        cfg = self._spline_cfg or {}
+        n_knots, degree = cfg["n_knots"], cfg["degree"]
+        cat = set(self._cat_cols.tolist()) if self._cat_cols is not None else set()
+        levels = np.linspace(0.0, 100.0, n_knots)
+        sel = [
+            j for j in range(Z.shape[1]) if j not in cat and np.unique(np.percentile(Z[:, j], levels)).size == n_knots
+        ]
+        if not sel:
+            return None
+        sel_arr = np.array(sel, dtype=np.intp)
+        keep = np.setdiff1d(np.arange(Z.shape[1]), sel_arr).astype(np.intp)
+        tf = SplineTransformer(
+            n_knots=n_knots, degree=degree, knots="quantile", extrapolation="linear", include_bias=False
+        ).fit(Z[:, sel_arr])
+        logger.warning("FinTFM-LinProbe: probe_spline expands %d of %d raw columns.", len(sel), Z.shape[1])
+        return {"keep": keep, "sel": sel_arr, "tf": tf}
+
+    def _raw_block(self, X: np.ndarray) -> np.ndarray:
+        """The raw block of the readout input: the squashed features, spline-expanded when fitted.
+
+        Args:
+            X: Preprocessed rows.
+
+        Returns:
+            The squashed features as float64; with a fitted spline stage, the columns it left
+            alone followed by the spline features of the others. Applying it refits nothing.
+        """
+        Z = self._conditioned(self._raw_conditioner, X)
+        sp = getattr(self, "_raw_spline", None)
+        if sp is None:
+            return Z
+        return np.hstack([Z[:, sp["keep"]], sp["tf"].transform(Z[:, sp["sel"]])])
 
     def _probe_input(self, est, X: np.ndarray, fit_idx: np.ndarray | None = None) -> np.ndarray:
         """The readout's input for rows ``X``: ``est``'s pre-head representation, plus options.
@@ -1687,7 +1860,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             blocks = [self._full_context_representation(est, X)]
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
-            blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
+            blocks.append(self._raw_block(X))
             if self._onehot_cfg is not None and self._oh_spec is not None:
                 oh = getattr(X, "oh", None)
                 if oh is None or len(oh) != len(X):
