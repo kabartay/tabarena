@@ -86,3 +86,16 @@ def test_env_override(monkeypatch):
     assert FinTFMLinearProbeModel._env_entry_overrides()["probe_prob_floor"] == 0.003
     monkeypatch.setenv("FINTFM_PROB_FLOOR", "off")
     assert "probe_prob_floor" not in FinTFMLinearProbeModel._env_entry_overrides()
+
+
+def test_env_crossfit_folds(monkeypatch):
+    """``FINTFM_PROBE_CROSSFIT_FOLDS`` sets ``probe_crossfit_folds``; unset leaves it out."""
+    monkeypatch.delenv("FINTFM_PROBE_CROSSFIT_FOLDS", raising=False)
+    assert "probe_crossfit_folds" not in FinTFMLinearProbeModel._env_entry_overrides()
+    monkeypatch.setenv("FINTFM_PROBE_CROSSFIT_FOLDS", "0")
+    assert FinTFMLinearProbeModel._env_entry_overrides()["probe_crossfit_folds"] == 0
+    monkeypatch.setenv("FINTFM_PROBE_CROSSFIT_FOLDS", "5")
+    assert FinTFMLinearProbeModel._env_entry_overrides()["probe_crossfit_folds"] == 5
+    monkeypatch.setenv("FINTFM_PROBE_CROSSFIT_FOLDS", "-1")
+    with pytest.raises(ValueError):
+        FinTFMLinearProbeModel._env_entry_overrides()

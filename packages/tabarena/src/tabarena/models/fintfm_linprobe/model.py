@@ -209,6 +209,8 @@ class FinTFMLinearProbeModel(FinTFMModel):
         - ``FINTFM_PROBE_BUDGET``: ``probe_budget``, a positive integer or ``all``.
         - ``FINTFM_PROB_FLOOR``: ``probe_prob_floor``, ``cv`` or a number in [0, 1); ``none`` or
           ``off`` leaves it off.
+        - ``FINTFM_PROBE_CROSSFIT_FOLDS``: ``probe_crossfit_folds``, an integer >= 0 (0 or 1 turns
+          cross-fitting off, as in the measured multiclass entry).
 
         Returns:
             The overrides; empty when no variable is set.
@@ -269,6 +271,13 @@ class FinTFMLinearProbeModel(FinTFMModel):
             value = floor if floor == "cv" else cls._float_or_raise(floor, "FINTFM_PROB_FLOOR")
             over["probe_prob_floor"] = cls._check_prob_floor(value, source="FINTFM_PROB_FLOOR")
             logger.warning("fintfm: probability floor %s (FINTFM_PROB_FLOOR)", floor)
+        folds = os.environ.get("FINTFM_PROBE_CROSSFIT_FOLDS", "").strip()
+        if folds:
+            k = cls._int_or_raise(folds, "FINTFM_PROBE_CROSSFIT_FOLDS")
+            if k < 0:
+                raise ValueError(f"FINTFM_PROBE_CROSSFIT_FOLDS must be >= 0, got {k}")
+            over["probe_crossfit_folds"] = k
+            logger.warning("fintfm: readout cross-fitting folds %d (FINTFM_PROBE_CROSSFIT_FOLDS)", k)
         return over
 
     @staticmethod
