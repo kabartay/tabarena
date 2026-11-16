@@ -114,13 +114,18 @@ def test_ensemble_is_the_mean_of_the_members_fitted_separately(tmp_path, checkpo
     )
     ens = _fit(tmp_path / "d", checkpoint, probe_ensemble=["xfit", "noxfit", "rawonly"])
     assert list(ens._ensemble_members) == ["xfit", "noxfit", "rawonly"]
-    np.testing.assert_allclose(_test_proba(ens), (xfit + noxfit + rawonly) / 3, rtol=0, atol=1e-9)
+    # predict_proba returns float32, so the members' probabilities are rounded before this mean
+    # and the ensemble's after it: the two agree to float32 resolution, not to 1e-9.
+    assert ens.predict_proba(_data()[2]).dtype == np.float32
+    atol = float(np.finfo(np.float32).eps)
+    np.testing.assert_allclose(_test_proba(ens), (xfit + noxfit + rawonly) / 3, rtol=0, atol=atol)
     two = _test_proba(_fit(tmp_path / "e", checkpoint, probe_ensemble="xfit,noxfit"))
-    np.testing.assert_allclose(two, (xfit + noxfit) / 2, rtol=0, atol=1e-9)
+    np.testing.assert_allclose(two, (xfit + noxfit) / 2, rtol=0, atol=atol)
 
 
 def test_full_context_representation_is_computed_once_per_batch(tmp_path, checkpoint, monkeypatch):
-    ens = _fit(tmp_path, checkpoint, probe_ensemble="xfit,noxfit,rawonly")
+    single = _fit(tmp_path / "a", checkpoint)
+    ens = _fit(tmp_path / "b", checkpoint, probe_ensemble="xfit,noxfit,rawonly")
     calls: list[int] = []
     original = FinancialTFMClassifier.transform_representation
 
@@ -129,8 +134,13 @@ def test_full_context_representation_is_computed_once_per_batch(tmp_path, checkp
         return original(clf, X, stage=stage)
 
     monkeypatch.setattr(FinancialTFMClassifier, "transform_representation", spy)
+    _test_proba(single)
+    single_calls, calls[:] = list(calls), []
     _test_proba(ens)
-    assert calls == [N_TEST], calls  # xfit and noxfit share one pass; rawonly reads none
+    # The partitioned entry scores each routed leaf's rows in its own call, so one pass over the
+    # test rows is one call per non-empty leaf. xfit and noxfit share that pass; rawonly reads none.
+    assert sum(single_calls) == N_TEST, single_calls
+    assert calls == single_calls, (calls, single_calls)
 
 
 @pytest.mark.parametrize("value", [["xfit", "bogus"], ["xfit", "xfit"], ["xfit"], "xfit,,nope", 3])
