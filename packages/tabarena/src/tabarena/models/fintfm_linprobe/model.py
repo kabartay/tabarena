@@ -7,6 +7,8 @@ import math
 import os
 from typing import TYPE_CHECKING, ClassVar
 
+import numpy as np
+
 from tabarena.models.fintfm.checkpoints import (
     BINARY_CHECKPOINT,
     MULTICLASS_CHECKPOINT_UNPUBLISHED,
@@ -16,7 +18,6 @@ from tabarena.models.fintfm.model import FinTFMModel, prefetch_weights  # noqa: 
 from tabarena.models.fintfm_linprobe.target_transform import TARGET_TRANSFORMS, TargetTransform, smearing_factor
 
 if TYPE_CHECKING:
-    import numpy as np
     import pandas as pd
 
 logger = logging.getLogger(__name__)
@@ -44,6 +45,10 @@ PARTITION_LIBRARY_MAX_DEPTH = 3
 #: Defaults of ``partition_scale_k`` and ``partition_depth_cap``.
 PARTITION_SCALE_K = 4.0
 PARTITION_DEPTH_CAP = 5
+#: Defaults of ``probe_onehot``: a level needs at least ``min_count`` training rows to get an
+#: indicator column, and at most ``max_columns`` indicator columns are added in total.
+ONEHOT_MIN_COUNT = 3
+ONEHOT_MAX_COLUMNS = 256
 #: The alpha grid ``reg_ridge_alphas="wide"`` names.
 WIDE_RIDGE_ALPHAS = (-3.0, 7.0, 21)
 #: Values of ``reg_readout``: the linear ridge, or ridge on random Fourier features.
@@ -175,6 +180,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
     prob_floor_losses_: dict | None = None
     #: What the depth scaling chose for the current fit (``None`` when off or unpartitioned).
     partition_depth_chosen_: dict | None = None
+    #: ``probe_onehot`` of the current fit as ``{"min_count", "max_columns"}``, or ``None`` (off).
+    _onehot_cfg: dict | None = None
+    #: The fitted indicator columns ``(column index among the categoricals, level code)`` as two
+    #: arrays, or ``None`` when none were made (off, or no categorical columns).
+    _oh_spec: tuple | None = None
     #: The fitted target transform, or ``None`` when none is applied.
     _target_tf: TargetTransform | None = None
     #: What the transform did: requested name, effective name, and the reason for a fallback.
@@ -198,6 +208,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
         self._set_default_param_value("probe_budget", TRAIN_SAMPLE_SIZE)
         self._set_default_param_value("probe_prob_floor", None)
+        self._set_default_param_value("probe_onehot", None)
 
     @classmethod
     def _env_entry_overrides(cls) -> dict:
@@ -217,6 +228,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
           ``off`` leaves it off.
         - ``FINTFM_PROBE_CROSSFIT_FOLDS``: ``probe_crossfit_folds``, an integer >= 0 (0 or 1 turns
           cross-fitting off, as in the measured multiclass entry).
+        - ``FINTFM_PROBE_ONEHOT``: ``probe_onehot``, ``on`` (defaults: levels with at least
+          ``ONEHOT_MIN_COUNT`` rows, at most ``ONEHOT_MAX_COLUMNS`` columns), ``off``, or a JSON object
+          ``{"min_count": int, "max_columns": int}``. Multiclass only; see :meth:`_check_onehot`.
 
         Returns:
             The overrides; empty when no variable is set.
@@ -288,7 +302,53 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 raise ValueError(f"FINTFM_PROBE_CROSSFIT_FOLDS must be >= 0, got {k}")
             over["probe_crossfit_folds"] = k
             logger.warning("fintfm: readout cross-fitting folds %d (FINTFM_PROBE_CROSSFIT_FOLDS)", k)
+        onehot = os.environ.get("FINTFM_PROBE_ONEHOT", "").strip()
+        if onehot and onehot.lower() not in ("none", "off", "false", "no"):
+            if onehot.lower() in ("on", "true", "yes"):
+                value = True
+            else:
+                try:
+                    value = json.loads(onehot)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"FINTFM_PROBE_ONEHOT must be on, off or a JSON object: {exc}") from exc
+            cls._check_onehot(value, source="FINTFM_PROBE_ONEHOT")
+            over["probe_onehot"] = value
+            logger.warning("fintfm: one-hot categorical indicators in the readout %s (FINTFM_PROBE_ONEHOT)", onehot)
         return over
+
+    @staticmethod
+    def _check_onehot(value, *, source: str) -> dict | None:
+        """Validate a ``probe_onehot`` value and resolve it to its settings.
+
+        Args:
+            value: ``None``/``False`` (off), ``True`` (defaults) or a dict with the optional keys
+                ``min_count`` (an int >= 1: a level needs this many training rows to get an
+                indicator) and ``max_columns`` (an int >= 1: the most indicator columns in total;
+                when more levels qualify, the most frequent ones are kept).
+            source: Where the value came from, for the error message.
+
+        Returns:
+            ``None`` for off, else ``{"min_count": int, "max_columns": int}``.
+
+        Raises:
+            ValueError: the value is of another type, names an unknown key, or a bound is not
+                an integer >= 1.
+        """
+        if value is None or value is False:
+            return None
+        cfg = {"min_count": ONEHOT_MIN_COUNT, "max_columns": ONEHOT_MAX_COLUMNS}
+        if value is True:
+            return cfg
+        if not isinstance(value, dict):
+            raise ValueError(f"{source} must be true, false or a JSON object, got {value!r}")
+        unknown = set(value) - set(cfg)
+        if unknown:
+            raise ValueError(f"{source} has unknown key(s) {sorted(unknown)}; known: {sorted(cfg)}")
+        for key, v in value.items():
+            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
+                raise ValueError(f"{source}: {key} must be an integer >= 1, got {v!r}")
+            cfg[key] = v
+        return cfg
 
     @staticmethod
     def _check_prob_floor(value, *, source: str):
@@ -549,7 +609,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             return
         if hasattr(self.model, "trees_"):
             # The partition setting wrapped the classifier: one probe per leaf context.
-            self._fit_leaf_probes(np.asarray(Xp, dtype=np.float32), y_arr)
+            self._fit_leaf_probes(_as_f32(Xp), y_arr)
             self._finish_prob_floor()
             self._log_crossfit()
             return
@@ -570,7 +630,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             )
             self._linear_probe = None
             return
-        Xp = np.asarray(Xp, dtype=np.float32)
+        Xp = _as_f32(Xp)
         self._fit_raw_conditioner(Xp)
         # The classifier was fitted on every row, so a row's position in its fit rows is its index.
         fit_idx = sub if crossfit else None
@@ -606,7 +666,95 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 "is not cross-fitted; set probe_crossfit_folds to 0 to use it"
             )
         self._crossfit_folds = folds
+        self._onehot_cfg = self._resolve_onehot(params.pop("probe_onehot", None))
         return entry
+
+    def _resolve_onehot(self, value) -> dict | None:
+        """The ``probe_onehot`` settings that apply to this fit, ``None`` when it is off or moot.
+
+        Only a multiclass fit whose readout has the ``raw`` block uses it; elsewhere a request is
+        ignored with a warning, so the binary and regression fits are untouched.
+
+        Args:
+            value: The ``probe_onehot`` hyperparameter.
+
+        Returns:
+            The settings from :meth:`_check_onehot`, or ``None``.
+        """
+        cfg = self._check_onehot(value, source="probe_onehot")
+        if cfg is None:
+            return None
+        if self.problem_type != "multiclass" or not self._probe_opts.get("raw"):
+            logger.warning(
+                "FinTFM-LinProbe: probe_onehot ignored, it needs a multiclass fit with the 'raw' probe option."
+            )
+            return None
+        return cfg
+
+    def _preprocess(self, X, y=None, is_train: bool = False, **kwargs):
+        """The base preprocessing, plus the one-hot indicators when ``probe_onehot`` is on.
+
+        The base encodes each categorical column as a level frequency for a multiclass target
+        (``fintfm.inference.categorical``), which the readout's ``raw`` block then inherits. This
+        reads the categorical columns' label codes from the same frame, before that encoding,
+        and attaches the indicator matrix to the returned array (see :class:`_AugmentedMatrix`);
+        the classifier sees the unchanged matrix. Off, this returns the base's array untouched.
+
+        On training rows the indicator columns are chosen: per categorical column the levels with
+        at least ``min_count`` rows (a two-level column gets only its rarer level, the other is its
+        complement), then the ``max_columns`` most frequent of them across all columns (ties by
+        column order, then level code). Query rows get the same columns; an unseen level is zero
+        everywhere.
+
+        Args:
+            X: The feature frame.
+            y: Training targets, passed on.
+            is_train: Whether these are the training rows.
+            **kwargs: Passed on.
+
+        Returns:
+            The base's float32 array, carrying the indicator block when one was made.
+        """
+        from autogluon.core.models import AbstractModel
+
+        arr = super()._preprocess(X, y=y, is_train=is_train, **kwargs)
+        cfg = self._onehot_cfg
+        if cfg is None:
+            return arr
+        gen = self._feature_generator
+        if gen is None or not gen.features_in:
+            self._oh_spec = None
+            return arr
+        frame = AbstractModel._preprocess(self, X, **kwargs)
+        codes = gen.transform(X=frame).to_numpy(dtype=np.float64, na_value=-1.0)
+        if is_train:
+            self._oh_spec = self._choose_indicators(codes, cfg)
+        if self._oh_spec is None:
+            return arr
+        cols, levels = self._oh_spec
+        return _AugmentedMatrix.attach(arr, (codes[:, cols] == levels[None, :]).astype(np.float32))
+
+    @staticmethod
+    def _choose_indicators(codes: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray] | None:
+        """Pick the indicator columns from the training rows' label codes.
+
+        Args:
+            codes: ``(n, c)`` label codes of the categorical columns, ``-1`` for missing.
+            cfg: ``{"min_count", "max_columns"}``.
+
+        Returns:
+            ``(column indices, level codes)``, sorted by column then level, or ``None`` when no
+            level qualifies.
+        """
+        cand: list[tuple[int, int, float]] = []
+        for j in range(codes.shape[1]):
+            values, counts = np.unique(codes[:, j], return_counts=True)
+            keep = [int(np.argmin(counts))] if len(values) == 2 else list(range(len(values)))
+            cand += [(-int(counts[i]), j, float(values[i])) for i in keep if counts[i] >= cfg["min_count"]]
+        if not cand:
+            return None
+        chosen = sorted(sorted(cand)[: cfg["max_columns"]], key=lambda t: (t[1], t[2]))
+        return np.array([c[1] for c in chosen], dtype=np.int64), np.array([c[2] for c in chosen], dtype=np.float64)
 
     def _apply_target_transform(self, y):
         """The training target in the readout's space, and the transform kept for predict.
@@ -1378,6 +1526,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
         cond = getattr(self, "_raw_conditioner", None)
         if cond is not None:
             blocks.append(np.nan_to_num(cond.transform(X), nan=0.0, posinf=3.0, neginf=-3.0).astype(np.float64))
+            if self._onehot_cfg is not None and self._oh_spec is not None:
+                oh = getattr(X, "oh", None)
+                if oh is None or len(oh) != len(X):
+                    raise AssertionError("probe_onehot is on but the rows carry no indicator matrix")
+                blocks.append(np.asarray(oh, dtype=np.float64))
         if self._probe_opts.get("head"):
             if self.problem_type == "regression":
                 blocks.append(np.asarray(self.model.predict(X), dtype=np.float64).reshape(-1, 1))
@@ -1399,7 +1552,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
                 pred = self._target_tf.inverse(pred, self._reg_smear)
             return pred
         if getattr(self, "_leaf_probes", None) is not None:
-            Xp = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
+            Xp = _as_f32(self.preprocess(X, **kwargs))
             part = self.model
             routes = part.route(Xp)
             out = np.zeros((Xp.shape[0], len(part.classes_)), dtype=np.float64)
@@ -1423,7 +1576,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
             # frame, since super()._predict_proba does its own preprocess call and would
             # double-preprocess an already-converted array otherwise.
             return super()._predict_proba(X, **kwargs)
-        X = np.asarray(self.preprocess(X, **kwargs), dtype=np.float32)
+        X = _as_f32(self.preprocess(X, **kwargs))
         proba = self._linear_probe.predict_proba(self._probe_input(self.model, X))
         return self._apply_prob_floor(self._convert_proba_to_unified_form(proba))
 
@@ -1446,6 +1599,50 @@ class FinTFMLinearProbeModel(FinTFMModel):
                     est, probe = part.global_estimator_, self._ridge_probe
                 out[rows] += probe.predict(self._probe_input(est.classifier_, Xp[rows]))
         return out / len(part.leaf_estimators_)
+
+
+class _AugmentedMatrix(np.ndarray):
+    """A float32 feature matrix that carries an extra per-row block (the ``probe_onehot`` indicators).
+
+    Behaves as the plain matrix to the classifier and the partition router (same shape and values).
+    Row selection with an index array, boolean mask or slice selects the same rows of the extra
+    block, so every ``Xp[rows]`` the readout code takes keeps the two aligned; any other indexing
+    (column selection, scalars) returns a plain array. Pickling drops the extra block.
+    """
+
+    oh: np.ndarray | None = None
+
+    @classmethod
+    def attach(cls, arr: np.ndarray, extra: np.ndarray) -> _AugmentedMatrix:
+        """``arr`` as a matrix carrying ``extra``.
+
+        Args:
+            arr: The ``(n, d)`` float32 feature matrix.
+            extra: ``(n, k)`` per-row block.
+
+        Returns:
+            A view of ``arr`` carrying ``extra`` as ``oh``.
+        """
+        out = arr.view(cls)
+        out.oh = extra
+        return out
+
+    def __getitem__(self, key):
+        """Select rows from both blocks; any other indexing returns a plain array."""
+        out = super().__getitem__(key)
+        if isinstance(key, tuple) or not isinstance(out, _AugmentedMatrix) or out.ndim != 2 or self.oh is None:
+            return out.view(np.ndarray) if isinstance(out, np.ndarray) else out
+        out.oh = self.oh[key]
+        return out
+
+    def __reduce__(self):
+        """Pickle as a plain array."""
+        return self.view(np.ndarray).__reduce__()
+
+
+def _as_f32(a) -> np.ndarray:
+    """``a`` as a float32 array, keeping an :class:`_AugmentedMatrix` (already float32) as it is."""
+    return a if isinstance(a, _AugmentedMatrix) else np.asarray(a, dtype=np.float32)
 
 
 def _binned_head(binner, est, X: np.ndarray) -> np.ndarray:
