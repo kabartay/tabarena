@@ -48,7 +48,8 @@ PARTITION_LIBRARY_MAX_DEPTH = 3
 PARTITION_SCALE_K = 4.0
 PARTITION_DEPTH_CAP = 5
 #: Defaults of ``probe_onehot``: a level needs at least ``min_count`` training rows to get an
-#: indicator column, and at most ``max_columns`` indicator columns are added in total.
+#: indicator column, and at most ``max_columns`` indicator columns are added in total. There is
+#: no default level cap: ``max_levels`` is ``None`` (off) unless set.
 ONEHOT_MIN_COUNT = 3
 ONEHOT_MAX_COLUMNS = 256
 #: Defaults of ``probe_spline``: knots per numeric column (placed at training-row quantiles) and
@@ -177,6 +178,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
     _reg_blend = None
     _reg_alphas = None
     _reg_readout: str = "ridge"
+    #: ``reg_rff_max_rows`` of the current fit: ``None`` (no cap) or the most training rows at which
+    #: ``reg_readout="rff"`` is still used.
+    _reg_rff_max_rows: int | None = None
+    #: The readout the current fit uses: ``_reg_readout``, except ``"ridge"`` when it is ``"rff"``
+    #: and the fit has more than ``_reg_rff_max_rows`` rows. Decided once per fit.
+    _reg_readout_eff: str = "ridge"
     #: Training rows of the current fit, read by :meth:`_resolve_entry` for the depth scaling.
     _n_fit_rows: int | None = None
     #: Large-table levers of the current fit, set by :meth:`_resolve_entry`.
@@ -226,6 +233,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("reg_readout_blend", None)
         self._set_default_param_value("reg_ridge_alphas", None)
         self._set_default_param_value("reg_readout", "ridge")
+        self._set_default_param_value("reg_rff_max_rows", None)
         self._set_default_param_value("partition_scale_with_n", False)
         self._set_default_param_value("partition_scale_k", PARTITION_SCALE_K)
         self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
@@ -246,6 +254,10 @@ class FinTFMLinearProbeModel(FinTFMModel):
           ``logspace:lo,hi,n`` (exponents of 10).
         - ``FINTFM_REG_READOUT``: ``reg_readout``, ``ridge`` (default) or ``rff`` (ridge on random
           Fourier features, bandwidth and alpha chosen by inner CV on the training rows).
+        - ``FINTFM_REG_RFF_MAX_ROWS``: ``reg_rff_max_rows``, an integer >= 1 (e.g. ``20000``). With
+          ``reg_readout=rff``, a fit with more training rows than this uses plain ridge, exactly as
+          ``reg_readout=ridge``; decided once per fit from the fit's row count. Unset or empty
+          means no cap. See :meth:`_check_reg_rff_max_rows`.
         - ``FINTFM_PARTITION_SCALE_N``: ``partition_scale_with_n``; ``on``/``true`` enables with the default k,
           ``off``/``false`` disables, a positive number enables and sets ``partition_scale_k``.
         - ``FINTFM_PROBE_BUDGET``: ``probe_budget``, a positive integer or ``all``.
@@ -254,8 +266,11 @@ class FinTFMLinearProbeModel(FinTFMModel):
         - ``FINTFM_PROBE_CROSSFIT_FOLDS``: ``probe_crossfit_folds``, an integer >= 0 (0 or 1 turns
           cross-fitting off, as in the measured multiclass entry).
         - ``FINTFM_PROBE_ONEHOT``: ``probe_onehot``, ``on`` (defaults: levels with at least
-          ``ONEHOT_MIN_COUNT`` rows, at most ``ONEHOT_MAX_COLUMNS`` columns), ``off``, or a JSON object
-          ``{"min_count": int, "max_columns": int}``. Multiclass only; see :meth:`_check_onehot`.
+          ``ONEHOT_MIN_COUNT`` rows, at most ``ONEHOT_MAX_COLUMNS`` columns, no level cap), ``off``, or a JSON object
+          ``{"min_count": int, "max_columns": int, "max_levels": int}`` (``max_levels`` >= 2: a
+          categorical column with more distinct levels than this in the training rows gets no
+          indicator columns; omitted, no cap), e.g. ``{"min_count": 3, "max_columns": 256,
+          "max_levels": 64}``. Multiclass only; see :meth:`_check_onehot`.
         - ``FINTFM_PROBE_SPLINE``: ``probe_spline``, ``on`` (defaults: ``SPLINE_N_KNOTS`` knots,
           degree ``SPLINE_DEGREE``, ``SPLINE_MAX_COLUMNS`` columns), ``off`` or empty, or a JSON object
           ``{"n_knots": int, "degree": int, "max_columns": int}`` (``n_knots`` >= 3, ``degree`` in 1..3,
@@ -298,6 +313,16 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if readout:
             over["reg_readout"] = cls._check_reg_readout(readout, source="FINTFM_REG_READOUT")
             logger.warning("fintfm: regression readout %s (FINTFM_REG_READOUT)", readout)
+        rff_rows = os.environ.get("FINTFM_REG_RFF_MAX_ROWS", "").strip()
+        if rff_rows:
+            try:
+                parsed = int(rff_rows)
+            except ValueError:
+                raise ValueError(f"FINTFM_REG_RFF_MAX_ROWS must be an integer >= 1, got {rff_rows!r}") from None
+            over["reg_rff_max_rows"] = cls._check_reg_rff_max_rows(parsed, source="FINTFM_REG_RFF_MAX_ROWS")
+            logger.warning(
+                "fintfm: regression rff readout capped at %d training rows (FINTFM_REG_RFF_MAX_ROWS)", parsed
+            )
         scale = os.environ.get("FINTFM_PARTITION_SCALE_N", "").strip().lower()
         if scale:
             if scale in ("on", "true", "yes"):
@@ -410,19 +435,22 @@ class FinTFMLinearProbeModel(FinTFMModel):
             value: ``None``/``False`` (off), ``True`` (defaults) or a dict with the optional keys
                 ``min_count`` (an int >= 1: a level needs this many training rows to get an
                 indicator) and ``max_columns`` (an int >= 1: the most indicator columns in total;
-                when more levels qualify, the most frequent ones are kept).
+                when more levels qualify, the most frequent ones are kept) and ``max_levels`` (an
+                int >= 2, default ``None`` = no cap: a categorical column with more distinct
+                levels than this in the training rows, missing not counted, gets no indicator
+                columns at all; label-free).
             source: Where the value came from, for the error message.
 
         Returns:
-            ``None`` for off, else ``{"min_count": int, "max_columns": int}``.
+            ``None`` for off, else ``{"min_count": int, "max_columns": int, "max_levels": int | None}``.
 
         Raises:
             ValueError: the value is of another type, names an unknown key, or a bound is not
-                an integer >= 1.
+                an integer >= 1 (``max_levels``: >= 2).
         """
         if value is None or value is False:
             return None
-        cfg = {"min_count": ONEHOT_MIN_COUNT, "max_columns": ONEHOT_MAX_COLUMNS}
+        cfg = {"min_count": ONEHOT_MIN_COUNT, "max_columns": ONEHOT_MAX_COLUMNS, "max_levels": None}
         if value is True:
             return cfg
         if not isinstance(value, dict):
@@ -431,8 +459,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if unknown:
             raise ValueError(f"{source} has unknown key(s) {sorted(unknown)}; known: {sorted(cfg)}")
         for key, v in value.items():
-            if isinstance(v, bool) or not isinstance(v, int) or v < 1:
-                raise ValueError(f"{source}: {key} must be an integer >= 1, got {v!r}")
+            if key == "max_levels" and v is None:
+                cfg[key] = None
+                continue
+            lo = 2 if key == "max_levels" else 1
+            if isinstance(v, bool) or not isinstance(v, int) or v < lo:
+                raise ValueError(f"{source}: {key} must be an integer >= {lo}, got {v!r}")
             cfg[key] = v
         return cfg
 
@@ -612,6 +644,26 @@ class FinTFMLinearProbeModel(FinTFMModel):
         return value
 
     @staticmethod
+    def _check_reg_rff_max_rows(value, *, source: str) -> int | None:
+        """Validate a ``reg_rff_max_rows`` value.
+
+        Args:
+            value: ``None`` (no cap) or an int >= 1.
+            source: Where the value came from, for the error message.
+
+        Returns:
+            ``None`` or the int.
+
+        Raises:
+            ValueError: the value is not ``None`` and not an integer >= 1.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{source} must be None or an integer >= 1, got {value!r}")
+        return value
+
+    @staticmethod
     def _check_reg_alphas(value, *, source: str):
         if value is None or value == "wide":
             return value
@@ -641,9 +693,44 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._reg_blend = self._check_reg_blend(get("reg_readout_blend", None), source="reg_readout_blend")
         self._reg_alphas = self._check_reg_alphas(get("reg_ridge_alphas", None), source="reg_ridge_alphas")
         self._reg_readout = self._check_reg_readout(get("reg_readout", "ridge"), source="reg_readout")
+        self._reg_rff_max_rows = self._check_reg_rff_max_rows(get("reg_rff_max_rows", None), source="reg_rff_max_rows")
+        self._reg_readout_eff = self._effective_reg_readout()
         folds = params.get("probe_crossfit_folds", PROBE_CROSSFIT_FOLDS)
         if self._reg_blend == "cv" and not (isinstance(folds, int) and folds >= 2):
             raise ValueError("reg_readout_blend='cv' needs probe_crossfit_folds >= 2 for out-of-fold head predictions")
+
+    def _effective_reg_readout(self) -> str:
+        """The readout this fit uses: ``rff`` falls back to ``ridge`` above ``reg_rff_max_rows`` rows.
+
+        Returns:
+            ``"rff"`` or ``"ridge"``. The row count is the fit's (``_n_fit_rows``), not the probe
+            subsample's; with the count unknown or no cap set the requested readout stands.
+        """
+        cap, n = self._reg_rff_max_rows, self._n_fit_rows
+        if self._reg_readout == "rff" and cap is not None and n is not None and n > cap:
+            return "ridge"
+        return self._reg_readout
+
+    def _resolve_reg_readout(self) -> None:
+        """Decide the regression readout of this fit from its row count and log it once.
+
+        Stores the result in ``_reg_readout_eff``, which the probe fit reads; predict uses the
+        fitted pipeline, so it follows the same choice. Called from ``_fit`` after the row count is
+        known; ``_parse_reg_levers`` recomputes the same value silently.
+        """
+        self._reg_readout_eff = self._effective_reg_readout()
+        cap = self._reg_rff_max_rows
+        if self._reg_readout == "rff" and cap is not None:
+            if self._reg_readout_eff == "ridge":
+                logger.warning(
+                    "fintfm: reg_readout=rff -> ridge: %d training rows exceed reg_rff_max_rows=%d",
+                    self._n_fit_rows,
+                    cap,
+                )
+            else:
+                logger.warning(
+                    "fintfm: reg_readout=rff kept: %d training rows within reg_rff_max_rows=%d", self._n_fit_rows, cap
+                )
 
     def preprocess(self, X, **kwargs):
         """AutoGluon's preprocess, keeping the training matrix when the readout is cross-fitted.
@@ -672,6 +759,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
 
         self._parse_reg_levers(dict(self._get_model_params()), pop=False)
         self._n_fit_rows = len(X)
+        self._resolve_reg_readout()
         y = self._apply_target_transform(y)
         super()._fit(
             X,
@@ -986,7 +1074,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         frame = AbstractModel._preprocess(self, X, **kwargs)
         codes = gen.transform(X=frame).to_numpy(dtype=np.float64, na_value=-1.0)
         if is_train:
-            self._oh_spec = self._choose_indicators(codes, cfg)
+            self._oh_spec = self._choose_indicators(codes, cfg, names=list(gen.features_in))
         if self._oh_spec is None:
             return arr
         cols, levels = self._oh_spec
@@ -1011,22 +1099,41 @@ class FinTFMLinearProbeModel(FinTFMModel):
         return np.sort(np.array([frame.columns.get_loc(c) for c in gen.features_in], dtype=np.intp))
 
     @staticmethod
-    def _choose_indicators(codes: np.ndarray, cfg: dict) -> tuple[np.ndarray, np.ndarray] | None:
+    def _choose_indicators(
+        codes: np.ndarray, cfg: dict, names: list[str] | None = None
+    ) -> tuple[np.ndarray, np.ndarray] | None:
         """Pick the indicator columns from the training rows' label codes.
 
         Args:
             codes: ``(n, c)`` label codes of the categorical columns, ``-1`` for missing.
-            cfg: ``{"min_count", "max_columns"}``.
+            cfg: ``{"min_count", "max_columns"}`` and optionally ``"max_levels"`` (``None`` or
+                absent: no cap). A column with more distinct non-missing levels than
+                ``max_levels`` gets no indicators; the skipped columns are logged once.
+            names: Column names for the log line, else positions are logged.
 
         Returns:
             ``(column indices, level codes)``, sorted by column then level, or ``None`` when no
             level qualifies.
         """
         cand: list[tuple[int, int, float]] = []
+        max_levels = cfg.get("max_levels")
+        skipped: list[str] = []
         for j in range(codes.shape[1]):
             values, counts = np.unique(codes[:, j], return_counts=True)
+            if max_levels is not None:
+                n_levels = int((values >= 0).sum())
+                if n_levels > max_levels:
+                    skipped.append(f"{names[j] if names is not None else j}={n_levels}")
+                    continue
             keep = [int(np.argmin(counts))] if len(values) == 2 else list(range(len(values)))
             cand += [(-int(counts[i]), j, float(values[i])) for i in keep if counts[i] >= cfg["min_count"]]
+        if skipped:
+            logger.warning(
+                "fintfm: probe_onehot max_levels=%d skipped %d column(s) (name=levels): %s",
+                max_levels,
+                len(skipped),
+                ", ".join(skipped),
+            )
         if not cand:
             return None
         chosen = sorted(sorted(cand)[: cfg["max_columns"]], key=lambda t: (t[1], t[2]))
@@ -1336,7 +1443,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         alphas = self._alpha_grid()
         fit_idx = None if fit_rows is None else _positions_in(fit_rows, sub)
         rep = self._probe_input(clf, Xp[sub], fit_idx)
-        if self._reg_readout == "rff":
+        if self._reg_readout_eff == "rff":
             from tabarena.models.fintfm_linprobe.rff import RFFRidgeCV
 
             head = RFFRidgeCV(alphas=alphas, random_state=seed)
