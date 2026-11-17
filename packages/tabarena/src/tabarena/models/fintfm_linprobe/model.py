@@ -120,6 +120,10 @@ class FinTFMLinearProbeModel(FinTFMModel):
       fit at or below it keeps the requested ``n_bags``. Decided once per fit from the fit's row
       count (``len(X)`` in ``_fit``, so a bagged child counts its own rows). ``None`` never gates.
       Applies to whichever problem type has a partition with ``n_bags`` set.
+    - ``spline_max_rows`` (int >= 1 or ``None``, default ``None``): a fit with more training rows
+      than this treats ``probe_spline`` as off (no spline columns); a fit at or below it, or
+      ``None``, is unchanged. Decided once per fit from the fit's row count (``len(X)`` in
+      ``_fit``, so a bagged child counts its own rows). No effect unless ``probe_spline`` is set.
     - ``probe_budget`` (int or ``"all"``, default 20,000 = ``TRAIN_SAMPLE_SIZE``): the readout's
       training-row budget, in total and split across leaves in proportion to their rows (at
       least ``LEAF_MIN_SAMPLE`` per leaf). ``"all"`` uses every training row. Cost: the
@@ -194,6 +198,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
     #: ``partition_bags_max_rows`` of the current fit: ``None`` (no gate) or the most training rows at
     #: which the partition keeps its requested ``n_bags``.
     _bags_max_rows: int | None = None
+    #: ``spline_max_rows`` of the current fit: ``None`` (no gate) or the most training rows at which
+    #: ``probe_spline`` still applies.
+    _spline_max_rows: int | None = None
     #: Large-table levers of the current fit, set by :meth:`_resolve_entry`.
     _scale_with_n: bool = False
     _scale_k: float = PARTITION_SCALE_K
@@ -243,6 +250,7 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._set_default_param_value("reg_readout", "ridge")
         self._set_default_param_value("reg_rff_max_rows", None)
         self._set_default_param_value("partition_bags_max_rows", None)
+        self._set_default_param_value("spline_max_rows", None)
         self._set_default_param_value("partition_scale_with_n", False)
         self._set_default_param_value("partition_scale_k", PARTITION_SCALE_K)
         self._set_default_param_value("partition_depth_cap", PARTITION_DEPTH_CAP)
@@ -287,6 +295,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
           degree ``SPLINE_DEGREE``, ``SPLINE_MAX_COLUMNS`` columns), ``off`` or empty, or a JSON object
           ``{"n_knots": int, "degree": int, "max_columns": int}`` (``n_knots`` >= 3, ``degree`` in 1..3,
           ``max_columns`` >= 1). Needs the ``raw`` probe option; see :meth:`_check_spline`.
+        - ``FINTFM_SPLINE_MAX_ROWS``: ``spline_max_rows``, an integer >= 1, or ``off`` / ``none`` for no
+          gate. A fit with more training rows than this runs without ``probe_spline``; see
+          :meth:`_resolve_spline`. Unset or empty means no gate.
 
         Returns:
             The overrides; empty when no variable is set.
@@ -415,6 +426,19 @@ class FinTFMLinearProbeModel(FinTFMModel):
             logger.warning(
                 "fintfm: spline expansion of the numeric raw columns in the readout %s (FINTFM_PROBE_SPLINE)", spline
             )
+        spline_rows = os.environ.get("FINTFM_SPLINE_MAX_ROWS", "").strip().lower()
+        if spline_rows:
+            if spline_rows in ("off", "none"):
+                over["spline_max_rows"] = None
+            else:
+                try:
+                    parsed = int(spline_rows)
+                except ValueError:
+                    raise ValueError(
+                        f"FINTFM_SPLINE_MAX_ROWS must be an integer >= 1, off or none, got {spline_rows!r}"
+                    ) from None
+                over["spline_max_rows"] = cls._check_spline_max_rows(parsed, source="FINTFM_SPLINE_MAX_ROWS")
+            logger.warning("fintfm: probe_spline row gate %s (FINTFM_SPLINE_MAX_ROWS)", spline_rows)
         return over
 
     @staticmethod
@@ -693,6 +717,26 @@ class FinTFMLinearProbeModel(FinTFMModel):
     @staticmethod
     def _check_bags_max_rows(value, *, source: str) -> int | None:
         """Validate a ``partition_bags_max_rows`` value.
+
+        Args:
+            value: ``None`` (no gate) or an int >= 1.
+            source: Where the value came from, for the error message.
+
+        Returns:
+            ``None`` or the int.
+
+        Raises:
+            ValueError: the value is not ``None`` and not an integer >= 1.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError(f"{source} must be None or an integer >= 1, got {value!r}")
+        return value
+
+    @staticmethod
+    def _check_spline_max_rows(value, *, source: str) -> int | None:
+        """Validate a ``spline_max_rows`` value.
 
         Args:
             value: ``None`` (no gate) or an int >= 1.
@@ -1043,6 +1087,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
         self._bags_max_rows = self._check_bags_max_rows(
             params.pop("partition_bags_max_rows", None), source="partition_bags_max_rows"
         )
+        self._spline_max_rows = self._check_spline_max_rows(
+            params.pop("spline_max_rows", None), source="spline_max_rows"
+        )
         self._prob_floor_setting = self._check_prob_floor(
             params.pop("probe_prob_floor", None), source="probe_prob_floor"
         )
@@ -1080,7 +1127,9 @@ class FinTFMLinearProbeModel(FinTFMModel):
 
         The spline features replace numeric columns of the ``raw`` block, so without that probe
         option there is nothing to expand and a request is ignored with a warning. It applies to
-        binary, multiclass and regression readouts alike.
+        binary, multiclass and regression readouts alike. A fit with more training rows than
+        ``spline_max_rows`` (``_n_fit_rows``; this fit's own rows, also for a bagged child) is
+        gated off and logged once; ``None`` never gates.
 
         Args:
             value: The ``probe_spline`` hyperparameter.
@@ -1094,6 +1143,12 @@ class FinTFMLinearProbeModel(FinTFMModel):
         if not self._probe_opts.get("raw"):
             logger.warning("FinTFM-LinProbe: probe_spline ignored, it needs the 'raw' probe option.")
             return None
+        cap, n = self._spline_max_rows, self._n_fit_rows
+        if cap is not None and n is not None:
+            if n > cap:
+                logger.warning("fintfm: probe_spline gated off: %d training rows exceed spline_max_rows=%d", n, cap)
+                return None
+            logger.warning("fintfm: probe_spline kept: %d training rows within spline_max_rows=%d", n, cap)
         return cfg
 
     def _resolve_onehot(self, value) -> dict | None:
